@@ -171,6 +171,15 @@ DEFAULT_TRENDING_CMDS = {
             "--platform cubepeg --platform likwid --platform goplus_creator --platform goplus_skills "
             "--platform openfour --platform flap --platform flap_stocks "
             "--interval 1h --order-by volume --limit 100 --raw"),
+    # ☠️ CADA CADENA TIENE SUS PROPIOS LAUNCHPADS. Sin una entrada aquí, el
+    # panel caía al comando genérico que arrastraba `--platform Pump.fun`
+    # (de Solana) y devolvía **0 tokens** en Robinhood: la pantalla entera a
+    # cero, como si estuviera roto.
+    # Verificado en el feed real: los launchpads de robinhood son `pons`,
+    # `pons_v2`, `longxyz` y `o1_rwa`. Pump.fun no existe ahí. Se deja sin
+    # filtro de plataforma para no volver a excluirlo todo.
+    "robinhood": ("gmgn-cli market trending --chain robinhood "
+                  "--interval 1h --order-by volume --limit 100 --raw"),
 }
 def default_trending_cmd(chain: str = "sol") -> str:
     cmd = DEFAULT_TRENDING_CMDS.get(chain)
@@ -863,11 +872,16 @@ class FeatureExtractor:
 # 4. 确定性硬门槛（先跑、便宜、无情）——返回 (ok, reason, gate_idx)
 #    gate_idx 与前端漏斗对齐：1=避雷 2=共识 3=ML排序 4=LLM
 # ──────────────────────────────────────────────────────────────────────────
-def hard_gates(f: TokenFeatures):
+def hard_gates(f: TokenFeatures, chain: str = "sol"):
     # gate 1 避雷（真实布尔/数值字段，无合成安全分）
     if f.honeypot:
         return False, "REJECT 避雷：honeypot 命中", 1
-    if CFG["require_renounced_mint"] and not f.renounced_mint:
+    # ☠️ `renounced_mint` ES UN CONCEPTO DE SPL (Solana): la mint authority de
+    # un token SPL. En cadenas EVM no existe y GMGN devuelve False por
+    # defecto — que NO significa "puede imprimir", significa "aquí este campo
+    # no aplica". Verificado: 100 de 100 tokens de Robinhood se rechazaban
+    # por esto, la pantalla salía entera a cero.
+    if chain == "sol" and CFG["require_renounced_mint"] and not f.renounced_mint:
         return False, "REJECT 避雷：未放弃增发权（可无限增发）", 1
     if f.buy_tax > CFG["max_buy_tax"] or f.sell_tax > CFG["max_sell_tax"]:
         return False, f"REJECT 避雷：税过高 买{f.buy_tax:.0%}/卖{f.sell_tax:.0%}", 1
@@ -1496,7 +1510,7 @@ def screen_once(chain: str) -> dict:
         if not t.get("address"):
             continue
         f = fx.build_from_row(t)                          # STEP 2 尽调（直接用 trending 行字段）
-        ok, reason, gate_idx = hard_gates(f)             # STEP 3 确定性硬门槛（先跑）
+        ok, reason, gate_idx = hard_gates(f, chain)      # STEP 3 确定性硬门槛（先跑）
         if not ok:
             decisions.append(_reject(f, reason, gate_idx, None))
             continue
