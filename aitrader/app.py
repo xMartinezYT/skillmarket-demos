@@ -52,14 +52,21 @@ CFG = {
     # 不再像旧版那样砍到极小（砍小反而只剩榜首最新/刷量币、聪明钱标记全为 0）。
     "top_n_prefilter": 100,        # 参与筛选的 trending 行数上限
     "llm_max": 20,                 # LLM 最多解释幸存者数（启发式占位不花钱，放大减少 gate3 误杀；接真实 LLM 再收紧）
-    "equity_sol": 10.0,
-    "risk_per_trade": 0.01,
+    # ── AJUSTADO AL CAPITAL REAL DE JAVI (31/08): 0,5 SOL en la wallet.
+    # Los valores de fábrica asumían 10 SOL de equity y posiciones de hasta
+    # 0,5 SOL — con su saldo eso sería meter TODO en una sola moneda.
+    # Medido ese día: entrar+salir cuesta 2,48% de media, así que cada
+    # operación arranca perdiendo. Con 0,05 SOL (~$10) por posición el daño
+    # de una mala es ~$0,25 y caben 6-8 intentos: suficiente para aprender
+    # qué señales funcionan sin quemar el saldo en dos operaciones.
+    "equity_sol": 0.5,
+    "risk_per_trade": 0.02,
     "hard_stop_pct": 0.35,
-    "max_per_trade_sol": 0.5,
-    "max_total_exposure_sol": 1.0,
-    "max_concurrent_positions": 20,   # 感受阶段放宽（SHADOW 不动真钱）；真实上线前按纪律调回（如 2~3）
-    "daily_loss_cap_sol": 0.5,
-    "kill_switch_consec_losses": 3,
+    "max_per_trade_sol": 0.05,        # ~$10 por moneda
+    "max_total_exposure_sol": 0.25,   # nunca más de la mitad del saldo fuera
+    "max_concurrent_positions": 4,    # 4 × 0,05 = 0,2 SOL comprometidos
+    "daily_loss_cap_sol": 0.12,       # tocas esto y deja de abrir en el día
+    "kill_switch_consec_losses": 3,   # 3 pérdidas seguidas y para
     # 避雷硬门槛（真实字段，无合成安全分；用户决策：直接用布尔/数值字段判）
     "require_renounced_mint": True,   # 必须放弃增发权
     "max_buy_tax": 0.10,
@@ -73,10 +80,23 @@ CFG = {
     "min_llm_conviction": 0.6,
     # dev 评估维度：初排后只对前 dev_pool_n 个幸存者额外查 dev 历史（token info 的 dev 对象），
     # 结果按地址缓存 dev_info_ttl_s 秒（dev 历史变化慢，跨轮复用、不每轮重拉，省 cli 配额）。
-    "dev_pool_n": 24,            # >llm_max，让 dev 子分能重排 gate3 名额边界
-    "dev_info_ttl_s": 600,
+    # ☠️ ESTE ES EL MULTIPLICADOR REAL DEL CONSUMO: 24 devs × 3 llamadas cada
+    # uno = 72 peticiones por escaneo con la caché fría. Bajado a 10, que
+    # sigue cubriendo de sobra el top del ranking (llm_max=20 pero solo las
+    # primeras llegan a "esperando decisión").
+    "dev_pool_n": 10,
+    # Caché de 10 a 30 min: el historial de un dev no cambia en minutos, y
+    # cada acierto de caché es una petición que no se gasta.
+    "dev_info_ttl_s": 1800,
     "min_dev_score": 0.15,       # dev 评分过滤：低于此分（工厂号/连环换皮/喷币）直接砍，不进 LLM/待决策
-    "dev_sec_scan_n": 3,         # dev 安全扫描：对该 dev 最近 N 个发币逐个查 token security（不安全则降分+提示风险）
+    # ☠️ CADA MONEDA EVALUADA CUESTA 1 + 1 + N LLAMADAS (token info +
+    # created-tokens + N × token security). Con N=3 y 10 monedas son 50
+    # peticiones POR ESCANEO, y con la pestaña abierta escaneando sola eso
+    # BANEA LA IP — hasta el punto de que pulsar COMPRAR devolvía HTTP 500
+    # porque no quedaba cuota ni para una consulta más.
+    # Con N=1 se conserva la señal principal (¿el dev lanza basura?) a un
+    # tercio del coste.
+    "dev_sec_scan_n": 1,         # dev 安全扫描：对该 dev 最近 N 个发币逐个查 token security
     "dev_fetch_workers": 8,      # dev 历史并发拉取线程数：冷缓存首轮把 24×(info+created+扫描) 串行 cli 改为并发，省掉「一直 loading」的长延时（subprocess 等待时释放 GIL）
     # 排序档位：趋势动能跟随（看现在在不在涨、买盘强不强、量价齐升）
     "rank_profile": "momentum",
@@ -121,6 +141,14 @@ def native_decimals(chain): return NATIVE_DECIMALS.get(chain, 9)
 # 已解锁(False)：LIVE 模式 + 已配 GMGN_PRIVATE_KEY 时，「一键买入/平仓」会真实发单、动用资金、不可逆。
 # 仍是人在环：只有用户点按钮才成交；SHADOW 是默认安全态，需手动切 LIVE 才真发。
 # ⚠️ 真实下单要求 ~/.config/gmgn/.env 里 GMGN_PRIVATE_KEY 非空（签名密钥），否则 gmgn-cli 报错。
+# Javi (31/08): pidió soltarlo explícitamente, con posiciones pequeñas y
+# capital de aprendizaje. Se le dieron los números antes (coste 2,48% por
+# ida+vuelta, 0,5 SOL de saldo) y decidió con esa información.
+#
+# SIGUE HABIENDO HUMANO EN EL BUCLE: nada se compra solo. Hace falta (a) que
+# el panel esté en LIVE —arranca en SHADOW— y (b) que Javi pulse el botón.
+# Los frenos duros están arriba: 0,05 SOL por posición, 4 abiertas máximo,
+# 0,12 SOL de pérdida diaria y parada tras 3 pérdidas seguidas.
 LIVE_TRADING_DISABLED = False
 
 # 公开演示（只读广播）：设环境变量 PUBLIC_DEMO=1 开启。用于把看板挂公网给不特定访客看
@@ -152,9 +180,15 @@ def default_trending_cmd(chain: str = "sol") -> str:
     return (f"gmgn-cli market trending --interval 1h --order-by volume "
             f"--direction desc --limit 100 --chain {chain} --raw")
 DEFAULT_TRENDING_CMD = default_trending_cmd("sol")   # 兼容旧引用
-DEFAULT_POLL_S = 5.6
+# ☠️ EL BOT Y EL PANEL COMPARTEN LA CUOTA DE GMGN Y SE PELEAN.
+# El bot autónomo (que es quien opera y gana dinero) consume ~8 llamadas/min.
+# Si el panel escanea a la vez, entre los dos superan el límite, GMGN banea la
+# IP y se quedan CIEGOS LOS DOS. Con el poll a 90s el panel deja sitio al bot.
+DEFAULT_POLL_S = 90.0
 # 同链 trending 短缓存：TTL 内多个 tab/请求复用同一次 cli 结果（同链多开不放大配额）。
-TRENDING_CACHE_TTL = 3.0
+# Caché del trending. Subida de 3s a 25s por el mismo motivo que el poll:
+# con 3s, dos pestañas abiertas duplican el consumo de cuota casi entero.
+TRENDING_CACHE_TTL = 75.0
 
 # ──────────────────────────────────────────────────────────────────────────
 # 1. .env 读写（凭据落地本机）
@@ -245,12 +279,42 @@ class LiveGMGN(GMGNAdapter):
         return resp
 
     def _cli(self, *args) -> dict:
+        """Llama a gmgn-cli. Reintenta si GMGN ha baneado la IP.
+
+        ☠️ Sin esto, un 429 sube tal cual como RuntimeError y el usuario ve
+        un HTTP 500 al pulsar COMPRAR — la operación se pierde por un límite
+        temporal que se resuelve esperando. El baneo dura ~60-300s y GMGN
+        dice cuánto queda, así que se espera y se reintenta en vez de fallar.
+
+        OJO: GMGN alarga el ban con cada reintento, así que son POCOS
+        intentos y bien espaciados, no un bucle agresivo.
+        """
         cmd = ["gmgn-cli", *args, "--chain", self.chain, "--raw"]
-        out = subprocess.run(cmd, capture_output=True, text=True,
-                             timeout=25, env=self.env)
-        if out.returncode != 0:
-            raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-        return self._check_code(json.loads(out.stdout))
+        ultimo = ""
+        for intento in range(3):
+            out = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=45, env=self.env)
+            texto = (out.stdout or "") + (out.stderr or "")
+            if "RATE_LIMIT" in texto or "429" in texto[:160]:
+                ultimo = texto.strip()
+                m = re.search(r"~(\d+)s remaining", texto)
+                # ☠️ ESPERAR LO QUE DIGA GMGN CUELGA LA WEB. El ban puede
+                # durar 300s y aquí se esperaba eso ×3 intentos: la pestaña
+                # se quedaba cargando sin fin y parecía que el panel estaba
+                # roto. Se espera POCO y se falla rápido con un mensaje
+                # claro; el usuario prefiere saberlo a mirar un spinner.
+                espera = min(int(m.group(1)) + 1, 8) if m else 5
+                if intento < 2:
+                    time.sleep(espera)
+                    continue
+                queda = m.group(1) if m else "?"
+                raise RuntimeError(
+                    f"GMGN ha limitado las peticiones. Vuelve a intentarlo "
+                    f"en {queda}s.")
+            if out.returncode != 0:
+                raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
+            return self._check_code(json.loads(out.stdout))
+        raise RuntimeError(ultimo or "gmgn-cli sin respuesta")
 
     def _run_cmd(self, cmd_str: str) -> dict:
         """执行用户自定义的完整 gmgn-cli 命令（不经 shell，避免注入扩大）。"""
@@ -372,8 +436,15 @@ class LiveGMGN(GMGNAdapter):
         raise RuntimeError(f"未找到 {self.chain} 链绑定钱包（检查 API Key 绑定）")
 
     def swap(self, from_wallet, input_token, output_token, amount=None,
-             percent=None, slippage=0.01):
-        # amount 与 percent 互斥：买入用 amount(最小单位)；卖出用 percent(币种非 currency 时)。
+             percent=None, slippage=10):
+        """Ejecuta el swap.
+
+        ☠️ `--slippage` SE EXPRESA EN PORCENTAJE ENTERO: `30` = 30%, no 0.30.
+        El código original mandaba `0.01` creyendo que era 1%, y GMGN lo
+        interpretaba como **0,01%** y rechazaba la orden entera:
+            HTTP 400 BAD_REQUEST — "slippage should not be lower than 1%"
+        Por eso NINGUNA compra desde el panel llegó a ejecutarse nunca.
+        """
         args = ["swap", "--from", from_wallet, "--input-token", input_token,
                 "--output-token", output_token, "--slippage", str(slippage)]
         if percent is not None:
@@ -1651,7 +1722,7 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
             wallet = g.wallet_address()              # 绑定 Key 的本链钱包，--from 必须一致
             amount = int(size_sol * (10 ** native_decimals(chain)))
             order = g.swap(from_wallet=wallet, input_token=native_token(chain),
-                           output_token=address, amount=amount, slippage=0.01)
+                           output_token=address, amount=amount, slippage=10)
         except Exception as e:                       # gmgn-cli 报错(如缺签名密钥)→ 不建仓，回清晰错误
             log("BUY_FAIL", symbol, str(e))
             raise HTTPException(502, f"链上买入失败：{e}")
@@ -1700,7 +1771,7 @@ def do_sell(address: str) -> dict:
         # 清仓：input=持仓币(非 currency，可用 percent)，output=该链原生币，percent=100 全清。
         try:
             g.swap(from_wallet=g.wallet_address(), input_token=address,
-                   output_token=native_token(pchain), percent=100, slippage=0.02)
+                   output_token=native_token(pchain), percent=100, slippage=15)
         except Exception as e:                       # 卖出失败→保留持仓，回清晰错误
             log("SELL_FAIL", p["symbol"], str(e))
             raise HTTPException(502, f"链上卖出失败：{e}")
@@ -1950,7 +2021,18 @@ def api_buy(b: BuyIn):
     _block_if_public()
     ch = valid_chain(b.chain)
     with ST.lock:
-        return do_buy(ch, b.address, b.size_sol)
+        try:
+            return do_buy(ch, b.address, b.size_sol)
+        except HTTPException:
+            raise
+        except RuntimeError as e:
+            # Un límite de peticiones de GMGN no es un fallo del servidor:
+            # devolver 500 con un traceback deja al usuario sin saber que
+            # basta con esperar un minuto. 429 + mensaje claro.
+            msg = str(e)
+            if "rate limit" in msg.lower() or "RATE_LIMIT" in msg:
+                raise HTTPException(429, msg)
+            raise HTTPException(502, f"No se pudo comprar: {msg[:180]}")
 
 @app.post("/api/sell")
 def api_sell(s: SellIn):
