@@ -197,7 +197,11 @@ DEFAULT_POLL_S = 90.0
 # 同链 trending 短缓存：TTL 内多个 tab/请求复用同一次 cli 结果（同链多开不放大配额）。
 # Caché del trending. Subida de 3s a 25s por el mismo motivo que el poll:
 # con 3s, dos pestañas abiertas duplican el consumo de cuota casi entero.
-TRENDING_CACHE_TTL = 75.0
+# ☠️ MEDIDO (31/08): con caché fría robinhood tardaba 73s y sol 20s; con la
+# caché caliente, 0,0s. Con TTL de 75s casi cada vistazo de Javi caía en frío
+# y esperaba un minuto entero — "va mucho más lento de lo que pensaba".
+# 5 min: las monedas que busca viven horas, un dato de hace 4 min sirve igual.
+TRENDING_CACHE_TTL = 300.0
 
 # ──────────────────────────────────────────────────────────────────────────
 # 1. .env 读写（凭据落地本机）
@@ -2078,6 +2082,24 @@ def index():
     if f.exists():
         return FileResponse(str(f))
     return JSONResponse(dict(msg="把 dashboard 存为 static/index.html 后刷新"), status_code=200)
+
+@app.on_event("startup")
+def _precalentar_cache():
+    """DESACTIVADO. Medido: empeoraba el problema en vez de arreglarlo.
+
+    La idea era mantener la caché caliente para que Javi no esperase 73s.
+    Pero la cuota de GMGN ya la consume el bot autónomo (~8 llamadas/min) y
+    ese es el que opera y gana dinero. Sumar 4/min más baneaba la IP, y un
+    ban devuelve la pantalla VACÍA — o sea, instantánea pero inútil.
+
+    Lo que sí quedó del intento y sí sirve: `TRENDING_CACHE_TTL` subido de
+    75s a 300s. Cubre el rato que Javi mira el panel sin gastar una sola
+    llamada extra.
+
+    Para reactivarlo haría falta un plan de GMGN con más cuota.
+    """
+    return
+
 
 @app.on_event("startup")
 def _maybe_start_public_broadcast():
