@@ -2290,7 +2290,7 @@ def api_ops(limit: int = 40):
                 continue
             if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
                                    "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
-                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL",
+                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL", "PRECIOS_FAIL", "PRECIO_VIEJO",
                                    "VENTA_EXTERNA", "VENTA_FAIL",
                                    "PIRAMIDE", "PIRAMIDE_FAIL"):
                 out.append(d)
@@ -2323,6 +2323,9 @@ def api_resumen():
 _DEX_CACHE: dict = {}     # mint -> (ts, precio_usd) via DexScreener
 
 
+_GMGN_PRECIO_CACHE: dict = {}
+
+
 def _precio_gmgn(mint: str, chain: str) -> float | None:
     """Precio del MISMO proveedor que fijó el entry_price al comprar.
 
@@ -2334,11 +2337,18 @@ def _precio_gmgn(mint: str, chain: str) -> float | None:
     stop no salta cuando debe. El pnl se calcula SIEMPRE con la fuente que
     dio la entrada; DexScreener queda solo como respaldo si GMGN falla.
     """
+    hit = _GMGN_PRECIO_CACHE.get(mint)
+    # 8s: el guardián revisa cada 45s y la UI cada 10s; con más caché el
+    # pnl se quedaba clavado ~48s (medido) y parecía congelado.
+    if hit and time.time() - hit[0] < 8:
+        return hit[1]
     try:
-        v = float(ST.adapter_for(chain).token_price(mint) or 0)
-        return v or None
+        v = float(ST.adapter_for(chain).token_price(mint) or 0) or None
     except Exception:
-        return None
+        v = None
+    if v:
+        _GMGN_PRECIO_CACHE[mint] = (time.time(), v)
+    return v
 
 
 def _precio_dexscreener(mint: str) -> float | None:
@@ -2411,7 +2421,7 @@ def api_positions_light():
     for p in ST.positions:
         pnl = p.get("pnl", 0)
         ep = p.get("entry_price") or 0
-        cur = _precio_dexscreener(p.get("address", "")) if ep else None
+        cur = PRECIOS.get(p.get("address", "")) if ep else None
         if cur and ep:
             pnl = round(cur / ep - 1, 4)
             p["pnl"] = pnl            # de paso lo persistimos en memoria
@@ -2606,8 +2616,14 @@ def vender_si_toca(chain: str) -> bool:
         ep = pos.get("entry_price") or 0
         if not addr or not ep:
             continue
-        # Misma fuente que el entry_price (GMGN); dex solo si GMGN falla.
-        cur = _precio_gmgn(addr, chain) or _precio_dexscreener(addr)
+        # MISMO número que ve Javi en pantalla: los dos leen del store.
+        cur = PRECIOS.get(addr)
+        edad = PRECIOS.edad(addr)
+        if cur and edad is not None and edad > 120:
+            # Precio viejo: no se decide con datos rancios, pero SE AVISA.
+            log("PRECIO_VIEJO", pos.get("symbol"),
+                f"último precio hace {edad:.0f}s — sin decidir esta vuelta")
+            continue
         if not cur:
             # Sin precio no se puede decidir — pero se DEJA CONSTANCIA, que
             # el silencio es lo que dejó correr las pérdidas del 01/09.
@@ -2950,6 +2966,105 @@ def tamano_auto(chain: str) -> float:
     return round(min(tope_chain, disponible), 5)
 
 
+class _PriceStore:
+    """UNA sola fuente de precios para todo el sistema.
+
+    ── POR QUÉ EXISTE ─────────────────────────────────────────────────────
+    El 01/09 se acumularon cinco bugs con la MISMA raíz: mezclar datos
+    baratos (precio de 1-4 posiciones abiertas) con datos caros (escaneo
+    de 100 tokens, 12s de freno por llamada, rate limit de GMGN):
+
+      · /api/positions tardaba 150s  -> consultaba gmgn-cli con el lock puesto
+      · /api/positions_light dio timeout -> le metí _precio_gmgn dentro
+      · el pnl se quedaba clavado 48s -> caché mal dimensionada
+      · UI y bot mostraban números distintos -> dex (UI) vs gmgn (ventas)
+      · el stop no evaluaba -> sin precio hacía `continue` en silencio
+
+    ── CÓMO LO RESUELVE ───────────────────────────────────────────────────
+    Un ÚNICO hilo escribe (`refrescar`), todos los demás solo leen (`get`).
+      · `get()` NUNCA toca la red: devuelve memoria. Imposible que la UI
+        se cuelgue o dé timeout, por definición.
+      · UI y guardián leen EL MISMO número, así que lo que Javi ve es
+        exactamente lo que el bot usa para decidir.
+      · Un solo consumidor de la API = imposible saturar el rate limit
+        desde varios sitios a la vez.
+      · Guarda la EDAD de cada precio: un dato viejo se puede detectar en
+        vez de tratarlo como fresco (que es lo que dejó correr el -70%).
+    """
+
+    def __init__(self):
+        self._d: dict = {}          # address -> (ts, precio, fuente)
+        self._lock = threading.Lock()
+
+    def get(self, address: str) -> float | None:
+        """Precio en memoria. Sin red, sin bloqueo, sin excusas."""
+        with self._lock:
+            v = self._d.get(address)
+        return v[1] if v else None
+
+    def edad(self, address: str) -> float | None:
+        """Segundos desde la última actualización. None si nunca se leyó."""
+        with self._lock:
+            v = self._d.get(address)
+        return (time.time() - v[0]) if v else None
+
+    def fuente(self, address: str) -> str:
+        with self._lock:
+            v = self._d.get(address)
+        return v[2] if v else "-"
+
+    def _pedir(self, address: str, chain: str):
+        """Consulta real. Solo la llama el hilo actualizador."""
+        try:
+            v = float(ST.adapter_for(chain).token_price(address) or 0)
+            if v:
+                return v, "gmgn"
+        except Exception:
+            pass
+        try:
+            req = urlreq.Request(
+                f"https://api.dexscreener.com/latest/dex/tokens/{address}",
+                headers={"User-Agent": "Mozilla/5.0"})
+            d = json.loads(urlreq.urlopen(req, timeout=8).read())
+            pares = d.get("pairs") or []
+            if pares:
+                return float(pares[0]["priceUsd"]), "dex"
+        except Exception:
+            pass
+        return None, "-"
+
+    def refrescar(self):
+        """Actualiza SOLO las posiciones abiertas. Máximo 4 tokens."""
+        objetivos = [(p.get("address"), p.get("chain", "sol"))
+                     for p in list(ST.positions) if p.get("address")]
+        for addr, chain in objetivos:
+            precio, fuente = self._pedir(addr, chain)
+            if precio:
+                with self._lock:
+                    self._d[addr] = (time.time(), precio, fuente)
+        # soltar lo que ya no se tiene
+        vivos = {a for a, _ in objetivos}
+        with self._lock:
+            for a in list(self._d):
+                if a not in vivos:
+                    self._d.pop(a, None)
+
+
+PRECIOS = _PriceStore()
+
+
+def _hilo_precios():
+    """Único escritor del store. Cada 8s; con 1-4 posiciones son 1-4
+    llamadas, muy por debajo del límite medido de ~5/min de GMGN."""
+    time.sleep(10)
+    while True:
+        try:
+            PRECIOS.refrescar()
+        except Exception as e:
+            log("PRECIOS_FAIL", "-", str(e)[:120])
+        time.sleep(8)
+
+
 def _guardian_posiciones():
     """Vigila lo ABIERTO cada 45s, en su propio hilo.
 
@@ -3104,6 +3219,7 @@ def _auto_trader():
             time.sleep(AUTO_CADA)
 
     threading.Thread(target=bucle, daemon=True).start()
+    threading.Thread(target=_hilo_precios, daemon=True).start()
     threading.Thread(target=_guardian_posiciones, daemon=True).start()
     log("SISTEMA", "-", f"motor arrancado · ronda {AUTO_CADA:.0f}s · corte -{MAX_DRAWDOWN*100:.0f}%")
 
