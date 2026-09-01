@@ -2286,7 +2286,7 @@ def api_ops(limit: int = 40):
                 continue
             if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
                                    "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
-                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA",
+                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA",
                                    "VENTA_EXTERNA", "VENTA_FAIL",
                                    "PIRAMIDE", "PIRAMIDE_FAIL"):
                 out.append(d)
@@ -2344,6 +2344,22 @@ def _precio_dexscreener(mint: str) -> float | None:
         precio = float(pares[0]["priceUsd"]) if pares else None
     except Exception:
         precio = None
+    if not precio:
+        # ☠️ FALLBACK OBLIGATORIO. DexScreener NO cubre Robinhood Chain (0
+        # pares, verificado) ni los tokens de Solana recién creados. Sin
+        # precio, `vender_si_toca` hacía `continue` y NO EVALUABA LA VENTA:
+        # el 01/09 dos posiciones llegaron a -70% y -41% sin que el stop de
+        # respaldo mirara una sola vez. Un control de riesgo que se apaga
+        # solo cuando falta un dato es peor que no tenerlo.
+        # GMGN sí tiene precio de las dos cadenas; cuesta 1 llamada, pero
+        # proteger una posición abierta vale más que una consulta de feed.
+        for ch in ("sol", "robinhood"):
+            try:
+                precio = float(ST.adapter_for(ch).token_price(mint) or 0) or None
+                if precio:
+                    break
+            except Exception:
+                continue
     if precio:
         _DEX_CACHE[mint] = (time.time(), precio)
     return precio
@@ -2570,6 +2586,10 @@ def vender_si_toca(chain: str) -> bool:
             continue
         cur = _precio_dexscreener(addr)
         if not cur:
+            # Sin precio no se puede decidir — pero se DEJA CONSTANCIA, que
+            # el silencio es lo que dejó correr las pérdidas del 01/09.
+            log("VENTA_CIEGA", pos.get("symbol"),
+                "sin precio de ninguna fuente: no se puede evaluar la venta")
             continue
         pnl = cur / ep - 1
         pico_previo = _PICOS.get(addr, 0.0)

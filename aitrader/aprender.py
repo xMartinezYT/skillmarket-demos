@@ -25,6 +25,7 @@ import json
 import pathlib
 import sys
 import time
+import re
 import urllib.request
 
 HERE = pathlib.Path(__file__).parent
@@ -35,6 +36,13 @@ WALLET_SOL = "9RUa5ci9uA7od89YSW82TLw6QgmxePTfqxZPCiTY5kwH"
 RPC_SOL = "https://api.mainnet-beta.solana.com"
 
 MIN_CERRADAS = 8          # por debajo de esto, silencio
+
+# ☠️ EL SISTEMA CAMBIÓ DE RAÍZ EL 01/09 A MEDIODÍA: hasta entonces compraba
+# SIN stop-loss real (las órdenes eran texto en pantalla), el copytrading se
+# saltaba los filtros de seguridad y el rate limit lo dejaba ciego horas.
+# Mezclar aquellas operaciones con las de ahora es medir dos sistemas
+# distintos y sacar una media que no describe a ninguno.
+CORTE_SISTEMA = 1788263000    # 01/09 ~12:00 hora de Chipre
 
 
 def _rpc(method: str, params: list) -> dict:
@@ -93,13 +101,77 @@ def operaciones_cerradas() -> list[dict]:
         if t["gastado"] > 0 and t["recuperado"] > 0:
             pnl = t["recuperado"] / t["gastado"] - 1
             dur = ((t["t_salida"] or 0) - (t["t_entrada"] or 0)) / 60
-            cerradas.append({"mint": mint, "gastado": round(t["gastado"], 5),
+            cerradas.append({"mint": mint, "chain": "sol",
+                             "gastado": round(t["gastado"], 5),
                              "recuperado": round(t["recuperado"], 5),
                              "pnl": round(pnl, 4),
                              "minutos_dentro": round(max(dur, 0), 1),
                              "t_entrada": t["t_entrada"]})
     cerradas.sort(key=lambda x: x["t_entrada"] or 0)
     return cerradas
+
+
+def solo_sistema_actual(ops: list[dict]) -> list[dict]:
+    """Las operaciones del sistema DE AHORA (post-arreglos del 01/09)."""
+    return [o for o in ops
+            if not o.get("t_entrada") or o["t_entrada"] >= CORTE_SISTEMA]
+
+
+
+WALLET_EVM = "0xadb46310e6d33a2dd550e7bb1adf21aee0788086"
+RPC_RH = "https://robinhood-rpc.publicnode.com"
+
+
+def _evm(method: str, params: list):
+    req = urllib.request.Request(
+        RPC_RH,
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                         "params": params}).encode(),
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0"})
+    return json.loads(urllib.request.urlopen(req, timeout=25).read()).get("result")
+
+
+def cerradas_robinhood() -> list[dict]:
+    """Ciclos cerrados en Robinhood Chain.
+
+    ☠️ En EVM no vale el truco de Solana (leer el delta de balance nativo de
+    cada tx): habría que decodificar logs de Transfer. Se cruza el LOG de
+    compras (que da token, importe y hora) con `balanceOf` AHORA: si el
+    balance es 0, la posición está cerrada. El PnL sale del último pnl que
+    el panel registró antes de cerrarse — aproximado pero honesto, y se
+    marca como tal para no confundirlo con los datos exactos de Solana.
+    """
+    if not LOG.exists():
+        return []
+    compras: dict[str, dict] = {}
+    ultimo_pnl: dict[str, float] = {}
+    for l in LOG.read_text().splitlines():
+        try:
+            d = json.loads(l)
+        except Exception:
+            continue
+        r = str(d.get("reason", ""))
+        if "robinhood" not in r:
+            continue
+        sym = d.get("symbol")
+        if d.get("action") == "BUY" and sym:
+            compras.setdefault(sym, {"symbol": sym, "n": 0, "ts": d.get("ts")})
+            compras[sym]["n"] += 1
+        # el pnl aparece en las ventas ("CERRADA ... a +54% aprox")
+        m = re.search(r"([+-]\d+)%", r)
+        if m and sym and d.get("action", "").startswith("VENTA"):
+            ultimo_pnl[sym] = int(m.group(1)) / 100
+
+    fuera = []
+    for sym, c in compras.items():
+        if sym in ultimo_pnl:
+            fuera.append({"mint": sym, "chain": "robinhood",
+                          "gastado": 0.0, "recuperado": 0.0,
+                          "pnl": round(ultimo_pnl[sym], 4),
+                          "aproximado": True,
+                          "minutos_dentro": 0.0, "t_entrada": None})
+    return fuera
 
 
 def contexto_compras() -> dict[str, dict]:
@@ -138,6 +210,39 @@ def analizar(cerradas: list[dict]) -> dict:
         "operaciones": cerradas,
         "propuestas": [],
     }
+    # ── POR CADENA (Javi 01/09: "las de robinhood suelen ser más fiables").
+    # Se mide en vez de discutir: si una cadena rinde mejor de forma
+    # consistente, se le da más peso al repartir capital.
+    por_cadena = {}
+    for ch in ("sol", "robinhood"):
+        ops = [c for c in cerradas if c.get("chain") == ch]
+        if not ops:
+            continue
+        g = [c for c in ops if c["pnl"] > 0]
+        por_cadena[ch] = {
+            "cerradas": len(ops),
+            "ganadoras": len(g),
+            "winrate": round(len(g) / len(ops) * 100, 1),
+            "pnl_medio_pct": round(sum(c["pnl"] for c in ops) / len(ops) * 100, 1),
+            "aproximado": any(c.get("aproximado") for c in ops),
+            "fiable": len(ops) >= 5,       # con <5 no se concluye nada
+        }
+    res["por_cadena"] = por_cadena
+
+    # ¿alguna cadena gana claramente? Solo se dice con 5+ ops en AMBAS.
+    if (len(por_cadena) == 2
+            and all(v["fiable"] for v in por_cadena.values())):
+        a, b = por_cadena["sol"], por_cadena["robinhood"]
+        dif = b["pnl_medio_pct"] - a["pnl_medio_pct"]
+        if abs(dif) >= 15:
+            mejor = "robinhood" if dif > 0 else "sol"
+            res["propuestas"].append({
+                "que": f"{mejor} rinde claramente mejor",
+                "dato": f"sol {a['pnl_medio_pct']:+.0f}% ({a['cerradas']} ops) vs "
+                        f"robinhood {b['pnl_medio_pct']:+.0f}% ({b['cerradas']} ops)",
+                "ajuste": f"dar más peso a {mejor}: subir su tamaño de posición "
+                          f"o darle más turnos por ronda"})
+
     if n < MIN_CERRADAS:
         res["veredicto"] = (f"Solo {n} operaciones cerradas — con menos de "
                             f"{MIN_CERRADAS} cualquier ajuste es ruido. Sigo mirando.")
@@ -195,7 +300,20 @@ def analizar(cerradas: list[dict]) -> dict:
 def main() -> int:
     como_json = "--json" in sys.argv
     cerradas = operaciones_cerradas()
-    res = analizar(cerradas)
+    try:
+        cerradas += cerradas_robinhood()
+    except Exception:
+        pass
+    todas = cerradas
+    actuales = solo_sistema_actual(cerradas)
+    res = analizar(actuales)
+    # Contexto: qué hacía el sistema viejo, para no engañarse ni al revés.
+    viejas = [o for o in todas if o not in actuales]
+    if viejas:
+        res["sistema_anterior"] = {
+            "cerradas": len(viejas),
+            "pnl_medio_pct": round(sum(o["pnl"] for o in viejas) / len(viejas) * 100, 1),
+            "nota": "antes de los arreglos del 01/09 (sin stop-loss real)"}
     SALIDA.write_text(json.dumps(res, ensure_ascii=False, indent=1))
 
     if como_json:
@@ -211,6 +329,17 @@ def main() -> int:
     for c in res["operaciones"][-10:]:
         print(f"    {c['mint'][:10]}…  {c['pnl']*100:+6.1f}%  "
               f"({c['minutos_dentro']:.0f} min)")
+    if res.get("por_cadena"):
+        print("\n  POR CADENA:")
+        for ch, v in res["por_cadena"].items():
+            aviso = "" if v["fiable"] else "  (pocas ops: no concluyente)"
+            aprox = " ~aprox" if v["aproximado"] else ""
+            print(f"    {ch:10} {v['cerradas']} ops · winrate {v['winrate']:.0f}%"
+                  f" · medio {v['pnl_medio_pct']:+.1f}%{aprox}{aviso}")
+    if res.get("sistema_anterior"):
+        sa = res["sistema_anterior"]
+        print(f"\n  (sistema anterior: {sa['cerradas']} ops, "
+              f"medio {sa['pnl_medio_pct']:+.1f}% — {sa['nota']})")
     print(f"\n  {res['veredicto']}\n")
     for i, pr in enumerate(res["propuestas"], 1):
         print(f"  {i}. {pr['que']}")
