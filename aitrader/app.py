@@ -1996,7 +1996,15 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
     ST.positions.append(dict(symbol=symbol, address=address, size_sol=round(size_sol, 4),
                              pnl=0.0, cycles=0, entry=entry, chain=chain,
                              entry_price=entry_price, cur_price=entry_price,
-                             ts=time.time()))  # cuándo se abrió: lo usa el
+                             ts=time.time()))
+    # Sembrar el store con el precio de entrada: sin esto el guardián ve la
+    # posición "sin precio" durante su primera vuelta y registra VENTA_CIEGA.
+    if entry_price:
+        try:
+            with PRECIOS._lock:
+                PRECIOS._d[address] = (time.time(), float(entry_price), "entrada")
+        except Exception:
+            pass  # cuándo se abrió: lo usa el
                                                # criterio de "tiempo muerto"
     save_positions()
     _verb = "成交" if filled else ("提交·待确认" if ST.mode == "LIVE" else "记录")
@@ -3214,6 +3222,7 @@ PRECIOS = _PriceStore()
 
 
 def _hilo_precios():
+    """Escritor único del store."""
     """Único escritor del store. Cada 8s; con 1-4 posiciones son 1-4
     llamadas, muy por debajo del límite medido de ~5/min de GMGN."""
     time.sleep(10)
