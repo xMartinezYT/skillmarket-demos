@@ -277,12 +277,36 @@ async function vender(addr) {
 /* ── bucle ──
    estado/ops son baratos (leen local): cada 20s.
    scanner llama a /api/run (caché backend 300s): cada 60s. */
-function tick() { $("reloj").textContent = new Date().toTimeString().slice(0, 8); }
+/* Javi (01/09): "pon algo que vaya refrescando solo, si no recargo hay
+   cosas que no salen". Tres capas:
+   1. intervalos normales (estado/ops 15s, resumen/scanner 60s)
+   2. al VOLVER a la pestaña se refresca TODO al instante — el navegador
+      congela los timers de pestañas en segundo plano y por eso "faltaban
+      cosas" al volver
+   3. cada refresco pinta "ACTUALIZADO HH:MM:SS" para que se VEA vivo */
+let ultimaAct = null;
+function tick() {
+  const ahora = new Date().toTimeString().slice(0, 8);
+  $("reloj").textContent = ultimaAct
+    ? ahora + " · actualizado " + ultimaAct : ahora;
+}
+function refrescaTodo() {
+  pintaEstado(); pintaResumen(); pintaOps(); pintaScanner();
+  ultimaAct = new Date().toTimeString().slice(0, 8);
+}
+function refrescaRapido() {
+  pintaEstado(); pintaOps();
+  ultimaAct = new Date().toTimeString().slice(0, 8);
+}
 setInterval(tick, 1000); tick();
-pintaEstado(); pintaResumen(); pintaOps(); pintaScanner();
-setInterval(() => { pintaEstado(); pintaOps(); }, 20000);
-setInterval(pintaResumen, 60000);
-setInterval(pintaScanner, 60000);
+refrescaTodo();
+setInterval(refrescaRapido, 15000);
+setInterval(() => { pintaResumen(); pintaScanner();
+  ultimaAct = new Date().toTimeString().slice(0, 8); }, 60000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refrescaTodo();
+});
+window.addEventListener("focus", refrescaTodo);
 </script>
 </body>
 </html>
