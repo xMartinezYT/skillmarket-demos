@@ -25,6 +25,7 @@ app.py — GMGN AI Trader 本地后端 (FastAPI)
 
 from __future__ import annotations
 import json, os, re, subprocess, random, datetime, pathlib, threading, math, shlex, time
+import urllib.request as urlreq
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, asdict
 from typing import Optional
@@ -59,11 +60,11 @@ CFG = {
     # operación arranca perdiendo. Con 0,05 SOL (~$10) por posición el daño
     # de una mala es ~$0,25 y caben 6-8 intentos: suficiente para aprender
     # qué señales funcionan sin quemar el saldo en dos operaciones.
-    "equity_sol": 0.5,
-    "risk_per_trade": 0.02,
+    "equity_sol": 0.37,        # saldo real medido 01/09 (~$38)
+    "risk_per_trade": 0.21,    # 0.21*0.37/0.35 = ~0.22 SOL -> tope lo baja a 0.19
     "hard_stop_pct": 0.35,
-    "max_per_trade_sol": 0.05,        # ~$10 por moneda
-    "max_total_exposure_sol": 0.25,   # nunca más de la mitad del saldo fuera
+    "max_per_trade_sol": 0.19,        # ~$20 por moneda (SOL a $103, medido)
+    "max_total_exposure_sol": 0.30,   # nunca más de la mitad del saldo fuera
     "max_concurrent_positions": 4,    # 4 × 0,05 = 0,2 SOL comprometidos
     "daily_loss_cap_sol": 0.12,       # tocas esto y deja de abrir en el día
     "kill_switch_consec_losses": 3,   # 3 pérdidas seguidas y para
@@ -84,7 +85,9 @@ CFG = {
     # uno = 72 peticiones por escaneo con la caché fría. Bajado a 10, que
     # sigue cubriendo de sobra el top del ranking (llm_max=20 pero solo las
     # primeras llegan a "esperando decisión").
-    "dev_pool_n": 10,
+    "dev_pool_n": 3,          # MEDIDO 01/09: el limite real de GMGN son ~5 llamadas/min.
+                              # Con 10 devs x 3 llamadas = 30 por escaneo = 6 min solo en dev.
+                              # Con 3 son 9 llamadas, que caben en una ronda.
     # Caché de 10 a 30 min: el historial de un dev no cambia en minutos, y
     # cada acierto de caché es una petición que no se gasta.
     "dev_info_ttl_s": 1800,
@@ -151,6 +154,21 @@ def native_decimals(chain): return NATIVE_DECIMALS.get(chain, 9)
 # 0,12 SOL de pérdida diaria y parada tras 3 pérdidas seguidas.
 LIVE_TRADING_DISABLED = False
 
+# ── TRADING AUTÓNOMO DEL PANEL (Javi, 01/09) ──────────────────────────────
+# El panel decidía y esperaba el clic. Con esto ejecuta él mismo la mejor
+# decisión de cada ronda. Sigue exigiendo mode=LIVE: en SHADOW mira y calla.
+# Corte único por abajo al -50% del pico de la cuenta; por arriba, sin techo.
+AUTO_TRADE = True
+
+# Freno global de llamadas a gmgn-cli, compartido por TODOS los hilos del
+# panel (escaneo, auto-trader, compras manuales). Sin el lock, dos hilos
+# llamaban a la vez y se saltaban el límite de 5/min aunque cada uno lo
+# respetara por separado.
+_CLI_LOCK = threading.Lock()
+_CLI_ULTIMA = {"t": 0.0, "ban_hasta": 0.0}
+AUTO_CADA = 300.0        # una ronda cada 3 min, alternando sol/robinhood
+MAX_DRAWDOWN = 0.50      # "hasta que pierda el 50%"
+
 # 公开演示（只读广播）：设环境变量 PUBLIC_DEMO=1 开启。用于把看板挂公网给不特定访客看
 # 真实筛选数据，同时把后端收敛成纯只读：
 #   1) 后台线程按 DEFAULT_POLL_S 定时跑 screen_once 并缓存——访客的 /api/run 只吐缓存，
@@ -193,7 +211,11 @@ DEFAULT_TRENDING_CMD = default_trending_cmd("sol")   # 兼容旧引用
 # El bot autónomo (que es quien opera y gana dinero) consume ~8 llamadas/min.
 # Si el panel escanea a la vez, entre los dos superan el límite, GMGN banea la
 # IP y se quedan CIEGOS LOS DOS. Con el poll a 90s el panel deja sitio al bot.
-DEFAULT_POLL_S = 90.0
+# Poll del FRONTEND a 60s (Javi: "bájale el poll"). Es seguro: /api/run
+# responde de caché (TTL 300s) y solo el escaneo de fondo llama a GMGN, así
+# que refrescar la tabla más a menudo NO gasta cuota — solo recoge antes lo
+# que el auto-trader ya trajo.
+DEFAULT_POLL_S = 60.0
 # 同链 trending 短缓存：TTL 内多个 tab/请求复用同一次 cli 结果（同链多开不放大配额）。
 # Caché del trending. Subida de 3s a 25s por el mismo motivo que el poll:
 # con 3s, dos pestañas abiertas duplican el consumo de cuota casi entero.
@@ -292,42 +314,41 @@ class LiveGMGN(GMGNAdapter):
         return resp
 
     def _cli(self, *args) -> dict:
-        """Llama a gmgn-cli. Reintenta si GMGN ha baneado la IP.
+        """Llama a gmgn-cli respetando el límite REAL de GMGN.
 
-        ☠️ Sin esto, un 429 sube tal cual como RuntimeError y el usuario ve
-        un HTTP 500 al pulsar COMPRAR — la operación se pierde por un límite
-        temporal que se resuelve esperando. El baneo dura ~60-300s y GMGN
-        dice cuánto queda, así que se espera y se reintenta en vez de fallar.
+        ☠️ MEDIDO EL 01/09 con todo lo demás parado: 1 llamada cada 6s se
+        banea a la primera; 1 cada 12s aguanta 12 de 12. El límite son ~5
+        llamadas/min y los docs no lo publican.
 
-        OJO: GMGN alarga el ban con cada reintento, así que son POCOS
-        intentos y bien espaciados, no un bucle agresivo.
+        Y hay una trampa: GMGN alarga el ban con cada intento que recibe
+        mientras dura ("repeated requests can extend the ban by 5s up to 5
+        minutes"). Por eso, al detectarlo, se apunta cuándo expira y NO se
+        vuelve a llamar hasta entonces — reintentar es lo que dejó al bot
+        ciego 9 horas la noche del 31/08.
         """
-        cmd = ["gmgn-cli", *args, "--chain", self.chain, "--raw"]
-        ultimo = ""
-        for intento in range(3):
-            out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=45, env=self.env)
-            texto = (out.stdout or "") + (out.stderr or "")
-            if "RATE_LIMIT" in texto or "429" in texto[:160]:
-                ultimo = texto.strip()
-                m = re.search(r"~(\d+)s remaining", texto)
-                # ☠️ ESPERAR LO QUE DIGA GMGN CUELGA LA WEB. El ban puede
-                # durar 300s y aquí se esperaba eso ×3 intentos: la pestaña
-                # se quedaba cargando sin fin y parecía que el panel estaba
-                # roto. Se espera POCO y se falla rápido con un mensaje
-                # claro; el usuario prefiere saberlo a mirar un spinner.
-                espera = min(int(m.group(1)) + 1, 8) if m else 5
-                if intento < 2:
-                    time.sleep(espera)
-                    continue
-                queda = m.group(1) if m else "?"
+        with _CLI_LOCK:
+            espera = 12.0 - (time.time() - _CLI_ULTIMA["t"])
+            if espera > 0:
+                time.sleep(espera)
+            if time.time() < _CLI_ULTIMA["ban_hasta"]:
+                queda = int(_CLI_ULTIMA["ban_hasta"] - time.time())
                 raise RuntimeError(
-                    f"GMGN ha limitado las peticiones. Vuelve a intentarlo "
-                    f"en {queda}s.")
-            if out.returncode != 0:
-                raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
-            return self._check_code(json.loads(out.stdout))
-        raise RuntimeError(ultimo or "gmgn-cli sin respuesta")
+                    f"GMGN ha limitado las peticiones. Vuelve en {queda}s.")
+            _CLI_ULTIMA["t"] = time.time()
+
+        cmd = ["gmgn-cli", *args, "--chain", self.chain, "--raw"]
+        out = subprocess.run(cmd, capture_output=True, text=True,
+                             timeout=45, env=self.env)
+        texto = (out.stdout or "") + (out.stderr or "")
+        if "RATE_LIMIT" in texto or "429" in texto[:160]:
+            m = re.search(r"~(\d+)s remaining", texto)
+            queda = int(m.group(1)) if m else 60
+            _CLI_ULTIMA["ban_hasta"] = time.time() + queda + 10
+            raise RuntimeError(
+                f"GMGN ha limitado las peticiones. Vuelve en {queda}s.")
+        if out.returncode != 0:
+            raise RuntimeError(f"gmgn-cli error: {out.stderr.strip()}")
+        return self._check_code(json.loads(out.stdout))
 
     def _run_cmd(self, cmd_str: str) -> dict:
         """执行用户自定义的完整 gmgn-cli 命令（不经 shell，避免注入扩大）。"""
@@ -449,7 +470,7 @@ class LiveGMGN(GMGNAdapter):
         raise RuntimeError(f"未找到 {self.chain} 链绑定钱包（检查 API Key 绑定）")
 
     def swap(self, from_wallet, input_token, output_token, amount=None,
-             percent=None, slippage=10):
+             percent=None, slippage=10, condition_orders=None):
         """Ejecuta el swap.
 
         ☠️ `--slippage` SE EXPRESA EN PORCENTAJE ENTERO: `30` = 30%, no 0.30.
@@ -457,6 +478,9 @@ class LiveGMGN(GMGNAdapter):
         interpretaba como **0,01%** y rechazaba la orden entera:
             HTTP 400 BAD_REQUEST — "slippage should not be lower than 1%"
         Por eso NINGUNA compra desde el panel llegó a ejecutarse nunca.
+
+        `condition_orders` adjunta take-profit y stop-loss A LA COMPRA, para
+        que vivan en GMGN y se ejecuten con el Mac apagado.
         """
         args = ["swap", "--from", from_wallet, "--input-token", input_token,
                 "--output-token", output_token, "--slippage", str(slippage)]
@@ -464,6 +488,18 @@ class LiveGMGN(GMGNAdapter):
             args += ["--percent", str(percent)]
         else:
             args += ["--amount", str(amount)]
+        if condition_orders:
+            # ☠️ `--priority-fee` ES OBLIGATORIO CUANDO SE ADJUNTAN
+            # condition-orders. Sin él GMGN responde:
+            #   HTTP 400 BAD_REQUEST — "priority_fee is required when
+            #   condition_orders is set"
+            # y la compra entera se cae (pasó con Temima y Mobi el 01/09).
+            args += ["--condition-orders", condition_orders,
+                     "--sell-ratio-type", "hold_amount", "--anti-mev"]
+            if self.chain == "sol":
+                args += ["--priority-fee", "0.0001", "--tip-fee", "0.0001"]
+            else:
+                args += ["--priority-fee", "0.0001"]
         return self._cli(*args)
     def order_get(self, order_id):  return self._cli("order", "get", "--order-id", order_id)
 
@@ -973,7 +1009,15 @@ def get_dev_profile(g: GMGNAdapter, chain: str, addr: str) -> dict | None:
     try:
         dp = g.dev_info(addr)
     except Exception:
-        return None                                     # 查不到 → 本轮按中性处理，不缓存失败、不阻断
+        # ☠️ AQUÍ ESTABA LA LENTITUD. Al fallar no se cacheaba nada, así que
+        # con la IP limitada por GMGN los 10 devs se reintentaban ENTEROS en
+        # cada escaneo — y cada reintento lleva su espera dentro de `_cli`.
+        # Medido: 18-28s por escaneo, el equivalente a ~58 llamadas en serie
+        # cuando solo hacen falta 30 repartidas en 8 hilos.
+        # Se cachea el fallo 60s: no bloquea (devuelve None = neutral) pero
+        # evita machacar la API mientras dura el límite.
+        _DEV_CACHE[key] = (now - CFG["dev_info_ttl_s"] + 60, None)
+        return None
     _DEV_CACHE[key] = (now, dp)
     return dp
 
@@ -1365,6 +1409,24 @@ class RiskManager:
         """组合级硬风控：返回 (allow, reason)。"""
         if self.halted:
             return False, "BLOCK kill-switch 已触发"
+        # ── CORTE DEL -50% (Javi, 01/09: "hasta que pierda el 50%; la
+        # ganancia puede ser ilimitada mientras tenga sentido").
+        # Se mide contra el saldo REAL de la cadena, no contra un contador
+        # interno: los contadores se reinician al reiniciar el proceso y
+        # entonces el corte no valdría nada. `equity_inicial` se fija la
+        # primera vez que arranca y se guarda en disco.
+        caida = drawdown_actual()
+        # ☠️ SIN LECTURA DE SALDO NO SE COMPRA. `drawdown_actual()` devuelve
+        # None cuando GMGN limita la IP y no se puede resolver la wallet. Si
+        # eso se tratara como "todo bien", el corte del -50% quedaría
+        # desactivado justo cuando el sistema está a ciegas — que es cuando
+        # más peligro hay. Ante la duda, no se abre nada.
+        if caida is None:
+            return False, "BLOCK sin lectura de saldo (no se puede medir el -50%)"
+        if caida >= MAX_DRAWDOWN:
+            self.halted = True
+            return False, (f"BLOCK -{MAX_DRAWDOWN*100:.0f}% alcanzado (caída {caida*100:.0f}%) — "
+                           f"parada total, no se abre nada más")
         if self.consec_losses >= CFG["kill_switch_consec_losses"]:
             self.halted = True
             return False, "BLOCK kill-switch（连亏）"
@@ -1375,6 +1437,100 @@ class RiskManager:
         if exposure + size_sol > CFG["max_total_exposure_sol"]:
             return False, "BLOCK 超出总敞口上限"
         return True, "ok"
+
+EQUITY_FILE = OUT_DIR / "equity_inicial.json"
+
+
+def _saldo_cadena_usd() -> float | None:
+    """Saldo nativo REAL de las dos cadenas, en dólares, leído del RPC.
+
+    No se usa `portfolio info` de GMGN porque reporta la wallet de robinhood
+    vacía aunque tenga fondos (verificado 31/08), ni se asumen precios: SOL
+    estaba a $103 y ETH a $2471 cuando yo calculaba con $190 y $3000.
+    """
+    total = 0.0
+    visto = False
+    # ☠️ LAS WALLETS VAN FIJAS, NO SE PIDEN A GMGN. Resolverlas con
+    # `wallet_address()` metía una llamada a `gmgn-cli` DENTRO del freno de
+    # seguridad: con la IP limitada devolvía None, el drawdown salía "sin
+    # datos" y el corte del -50% quedaba ciego justo cuando más falta hace.
+    # Un freno no puede depender de la API que falla. Son las wallets de la
+    # API key de Javi, verificadas contra la cadena el 31/08.
+    pares = (("sol", "https://solana-rpc.publicnode.com", "SOL-USD",
+              "9RUa5ci9uA7od89YSW82TLw6QgmxePTfqxZPCiTY5kwH"),
+             ("robinhood", "https://robinhood-rpc.publicnode.com", "ETH-USD",
+              "0xadb46310e6d33a2dd550e7bb1adf21aee0788086"))
+    for chain, rpc, par, w in pares:
+        try:
+            if chain == "sol":
+                cuerpo = {"jsonrpc": "2.0", "id": 1, "method": "getBalance",
+                          "params": [w]}
+            else:
+                cuerpo = {"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance",
+                          "params": [w, "latest"]}
+            req = urlreq.Request(
+                rpc, data=json.dumps(cuerpo).encode(),
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0"})
+            d = json.loads(urlreq.urlopen(req, timeout=12).read())
+            r = d.get("result")
+            nativo = (r.get("value", 0) / 1e9) if isinstance(r, dict) else int(r, 16) / 1e18
+
+            pr = urlreq.Request(
+                f"https://api.coinbase.com/v2/prices/{par}/spot",
+                headers={"User-Agent": "Mozilla/5.0"})
+            precio = float(json.loads(
+                urlreq.urlopen(pr, timeout=12).read())["data"]["amount"])
+            total += nativo * precio
+            visto = True
+        except Exception:
+            continue
+    return total if visto else None
+
+
+_EQUITY_CACHE: dict = {"t": 0.0, "v": None}
+
+
+def drawdown_actual() -> float | None:
+    """Cuánto ha caído la cuenta desde que arrancó, de 0 a 1.
+
+    Javi (01/09): *"hasta que pierda el 50%; la ganancia puede ser ilimitada
+    mientras tenga sentido"*. Por eso solo hay corte por abajo: arriba no se
+    toca nada.
+
+    ☠️ La referencia se guarda EN DISCO. Si viviera en memoria, reiniciar el
+    proceso (o un crash) la reiniciaría al saldo del momento y el corte del
+    -50% no saltaría nunca — justo el fallo que haría inútil el freno.
+    Además el máximo se actualiza al alza: si la cuenta sube a $400, el -50%
+    pasa a medirse desde $400, así no se devuelve todo lo ganado.
+    """
+    ahora = _saldo_cadena_usd()
+    if ahora is None or ahora <= 0:
+        # Si falla la lectura pero hay una reciente en caché (< 5 min), se
+        # usa esa: el `gate` bloquea cuando no hay dato, y un rate limit
+        # puntual no debe parar el sistema entero.
+        if time.time() - _EQUITY_CACHE["t"] < 300 and _EQUITY_CACHE["v"]:
+            ahora = _EQUITY_CACHE["v"]
+        else:
+            return None
+    _EQUITY_CACHE.update({"t": time.time(), "v": ahora})
+    try:
+        ref = json.loads(EQUITY_FILE.read_text())
+    except Exception:
+        ref = {}
+    pico = float(ref.get("pico") or 0)
+    if ahora > pico:
+        pico = ahora
+        try:
+            EQUITY_FILE.write_text(json.dumps(
+                {"pico": pico, "inicial": ref.get("inicial") or ahora,
+                 "actualizado": datetime.datetime.now().isoformat()}))
+        except Exception:
+            pass
+    if pico <= 0:
+        return None
+    return max(0.0, 1 - ahora / pico)
+
 
 SUPPORTED_CHAINS = ("sol", "bsc", "base", "eth", "robinhood")
 
@@ -1739,8 +1895,25 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
         try:
             wallet = g.wallet_address()              # 绑定 Key 的本链钱包，--from 必须一致
             amount = int(size_sol * (10 ** native_decimals(chain)))
+            # ☠️ ANTES COMPRABA SIN RED. `exit_plan()` solo devolvía TEXTO
+            # para pintar en la tabla: no creaba ninguna orden real. Javi
+            # compró bucket y zdog el 01/09 a las 02:27 y estuvieron NUEVE
+            # HORAS dentro sin que saltara nada (-72% y -41%), porque el
+            # stop-loss no existía fuera de la pantalla.
+            # Ahora las salidas se adjuntan a la propia compra y viven en
+            # GMGN: se ejecutan aunque el Mac esté apagado o la IP baneada.
+            salidas = json.dumps([
+                {"order_type": "profit_stop", "side": "sell",
+                 "price_scale": "120", "sell_ratio": "40"},
+                {"order_type": "profit_stop_trace", "side": "sell",
+                 "price_scale": "150", "sell_ratio": "100",
+                 "drawdown_rate": "30"},
+                {"order_type": "loss_stop", "side": "sell",
+                 "price_scale": "40", "sell_ratio": "100"},
+            ])
             order = g.swap(from_wallet=wallet, input_token=native_token(chain),
-                           output_token=address, amount=amount, slippage=10)
+                           output_token=address, amount=amount, slippage=10,
+                           condition_orders=salidas)
         except Exception as e:                       # gmgn-cli 报错(如缺签名密钥)→ 不建仓，回清晰错误
             log("BUY_FAIL", symbol, str(e))
             raise HTTPException(502, f"链上买入失败：{e}")
@@ -2099,6 +2272,262 @@ def _precalentar_cache():
     Para reactivarlo haría falta un plan de GMGN con más cuota.
     """
     return
+
+
+def sincronizar_posiciones() -> int:
+    """Borra las posiciones que ya NO están en la wallet.
+
+    ☠️ ESTE ERA EL BUG QUE DEJABA EL BOT MUERTO. El panel apunta la posición
+    al comprar, pero cuando el take-profit / stop-loss se ejecuta EN GMGN
+    (fuera del panel), nadie la borra. La posición fantasma sigue contando
+    para `exposure()`, y como cada compra pide 0,19 de un tope de 0,30, el
+    `gate` respondía "超出总敞口上限" a TODO — bloqueo permanente.
+
+    Síntoma que veía Javi: 9 candidatas en pantalla, todas con `risk_warn`,
+    y el bot sin comprar nada durante horas.
+
+    La verdad está en la cadena, no en la memoria del panel: se consulta qué
+    tokens tiene la wallet de verdad y se descarta lo demás.
+    """
+    if not ST.positions:
+        return 0
+    vivos = set()
+    # ☠️ DOS programas de token, no uno. Los tokens nuevos de Pump.fun salen
+    # como Token-2022 (`TokenzQdBN...`); mirando solo el clásico, la posición
+    # de Cp3uq6D1 (comprada 13:52 el 01/09) parecía inexistente y esta función
+    # la habría borrado del panel CON el token aún en la wallet.
+    for prog in ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                 "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"):
+        try:
+            w = "9RUa5ci9uA7od89YSW82TLw6QgmxePTfqxZPCiTY5kwH"
+            cuerpo = {"jsonrpc": "2.0", "id": 1,
+                      "method": "getTokenAccountsByOwner",
+                      "params": [w, {"programId": prog},
+                                 {"encoding": "jsonParsed"}]}
+            req = urlreq.Request("https://api.mainnet-beta.solana.com",
+                                 data=json.dumps(cuerpo).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "Mozilla/5.0"})
+            d = json.loads(urlreq.urlopen(req, timeout=15).read())
+            for x in (d.get("result") or {}).get("value", []):
+                i = x["account"]["data"]["parsed"]["info"]
+                if (i["tokenAmount"].get("uiAmount") or 0) > 0:
+                    vivos.add(i["mint"])
+        except Exception:
+            return 0            # sin lectura fiable, no se toca nada
+
+    antes = len(ST.positions)
+    ST.positions = [p for p in ST.positions
+                    if p.get("chain") != "sol" or p.get("address") in vivos]
+    fuera = antes - len(ST.positions)
+    if fuera:
+        try:
+            save_positions()
+        except Exception:
+            pass
+        log("SYNC", "-", f"{fuera} posición(es) cerradas fuera del panel")
+    return fuera
+
+
+COPYTRADE = True         # Javi (01/09): "trading y copytrading"
+COPY_MC_MIN = 8_000      # mismo suelo de cap que el screener normal
+COPY_MAX_SIG_AGE = 600   # señales de hace >10 min: el tren ya pasó
+_COPY_VISTOS: set = set()
+
+
+def señal_smart_money(chain: str) -> dict | None:
+    """COPYTRADING vía señal 12 de GMGN: varios smart-money comprando el
+    mismo token a la vez (cluster-buy). Es la señal de 'copiar wallets
+    ganadoras' sin seguir una wallet concreta.
+
+    Por qué así y no `track smartmoney`: esa lista venía vacía (`{"list":[]}`
+    — requiere seguir wallets a mano en la web). La señal 12 la calcula GMGN
+    sobre TODAS las wallets que él etiqueta como smart money, que es
+    exactamente lo que pide Javi: copiar al dinero listo, no a un señor.
+
+    ☠️ Solo sol/bsc: `market signal --chain` rechaza robinhood aunque la
+    skill diga lo contrario — verificado contra el CLI real.
+    """
+    if chain != "sol":
+        return None
+    try:
+        g = ST.adapter_for(chain)
+        if not hasattr(g, "_cli"):
+            return None          # adapter Mock (sin API key): no hay señal
+        señales = g._cli("market", "signal", "--signal-type", "12",
+                         "--mc-min", str(COPY_MC_MIN))
+        lista = señales if isinstance(señales, list) else señales.get("list", [])
+    except Exception:
+        return None
+    ahora = time.time()
+    for s in lista:
+        addr = s.get("token_address") or ""
+        if not addr or addr in _COPY_VISTOS:
+            continue
+        if ahora - (s.get("trigger_at") or 0) > COPY_MAX_SIG_AGE:
+            continue
+        # Momentum negativo tras la señal = los listos ya salieron.
+        mc = s.get("market_cap") or 0
+        tmc = s.get("first_trigger_mc") or s.get("trigger_mc") or 0
+        if tmc and mc < tmc * 0.7:
+            continue
+        _COPY_VISTOS.add(addr)
+        d = s.get("data") or {}
+        return {"address": addr, "symbol": d.get("symbol") or addr[:6],
+                "veces": s.get("signal_times", 1)}
+    return None
+
+
+def tamano_auto(chain: str) -> float:
+    """Importe adaptado al saldo REAL de la cadena QUE SE VA A OPERAR.
+
+    ☠️ BUG ORIGINAL (01/09): consultaba SIEMPRE la wallet de Solana, aunque
+    `chain` fuera robinhood. Con sol casi vacía devolvía 0 para TODAS las
+    cadenas y dejó la pata de Robinhood apagada de facto — con $317 en ETH
+    sin usar allí. Cada cadena lee AHORA su propio RPC y su propia wallet.
+
+    ☠️ Con importe fijo, en cuanto hay una posición abierta el saldo baja
+    del tope y las compras siguientes fallan con `GetSwapRouteErr:
+    insufficient account balance` (pasó con Mobi y PONSPOT). Colchón para
+    fees; si no da ni para media posición, 0 y la ronda se salta sin error.
+    """
+    tope = CFG["max_per_trade_sol"]
+    try:
+        if chain == "sol":
+            cuerpo = {"jsonrpc": "2.0", "id": 1, "method": "getBalance",
+                      "params": ["9RUa5ci9uA7od89YSW82TLw6QgmxePTfqxZPCiTY5kwH"]}
+            url = "https://api.mainnet-beta.solana.com"
+        else:
+            cuerpo = {"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance",
+                      "params": ["0xadb46310e6d33a2dd550e7bb1adf21aee0788086",
+                                 "latest"]}
+            url = "https://robinhood-rpc.publicnode.com"
+        req = urlreq.Request(url, data=json.dumps(cuerpo).encode(),
+                             headers={"Content-Type": "application/json",
+                                      "User-Agent": "Mozilla/5.0"})
+        r = json.loads(urlreq.urlopen(req, timeout=12).read())["result"]
+        saldo = (r["value"] / 1e9) if isinstance(r, dict) else int(r, 16) / 1e18
+    except Exception:
+        return tope                    # sin lectura: se intenta el tope
+    if chain == "sol":
+        disponible = saldo - 0.02      # colchón fees/rent en SOL
+        tope_chain = tope
+    else:
+        # En Robinhood el importe va en ETH: mismo valor en dólares que el
+        # tope de sol (0.19 SOL ≈ $20 ≈ 0.008 ETH), colchón de gas menor.
+        disponible = saldo - 0.002
+        tope_chain = 0.008
+    if disponible < tope_chain * 0.5:
+        return 0.0                     # ni media posición: no operar
+    return round(min(tope_chain, disponible), 5)
+
+
+@app.on_event("startup")
+def _auto_trader():
+    """El AI Trader opera SOLO, sin que Javi pulse nada.
+
+    Javi (01/09): *"metele a hacer trading al AI Trader hasta que pierda el
+    50%; la ganancia puede ser ilimitada mientras tenga sentido"*.
+
+    El panel ya decidía (marca las supervivientes como `ACTION`), pero se
+    quedaba esperando el clic. Este hilo coge esas decisiones y las ejecuta,
+    respetando TODOS los frenos que ya existían (`ST.risk.gate`), incluido
+    el corte nuevo del -50% sobre el saldo real.
+
+    Solo actúa en LIVE. En SHADOW mira y no compra, que es el estado seguro
+    por defecto.
+    """
+    if not AUTO_TRADE:
+        return
+
+    def bucle():
+        time.sleep(45)                     # deja arrancar y que el ban expire
+        turno = 0
+        while True:
+            try:
+                # Robinhood PRIMERO: con sol delante, la ronda de sol gastaba
+                # la cuota (5 llam/min) y cuando llegaba el turno de robinhood
+                # el trending fallaba por rate limit — 185 TRENDING_FAIL en el
+                # log, casi todos de robinhood. El orden del turno era el
+                # sesgo, no el mercado.
+                chain = ("robinhood", "sol")[turno % 2]
+                turno += 1
+                if ST.mode != "LIVE" or LIVE_TRADING_DISABLED:
+                    time.sleep(AUTO_CADA)
+                    continue
+                caida = drawdown_actual()
+                if caida is not None and caida >= MAX_DRAWDOWN:
+                    log("AUTO", "-", f"parado: caída {caida*100:.0f}% ≥ {MAX_DRAWDOWN*100:.0f}%")
+                    ST.risk.halted = True
+                    time.sleep(600)
+                    continue
+                r = screen_once(chain) or {}
+                # Limpia posiciones ya cerradas en GMGN ANTES de mirar las
+                # candidatas: si no, la exposición fantasma bloquea todo.
+                sincronizar_posiciones()
+
+                # ── COPYTRADING (Javi, 01/09): si hay cluster-buy de smart
+                # money, va PRIMERO — el dinero listo comprando a la vez es
+                # mejor señal que el screener. Pasa por el mismo gate y el
+                # mismo do_buy (con TP/SL adjuntos) que todo lo demás.
+                if COPYTRADE:
+                    sm = señal_smart_money(chain)
+                    if sm:
+                        cuanto = tamano_auto(chain)
+                        permite, nota = (ST.risk.gate(
+                            cuanto, len(ST.positions), ST.exposure())
+                            if cuanto > 0 else (False, "sin saldo suficiente"))
+                        if permite:
+                            try:
+                                res = do_buy(chain, sm["address"], cuanto)
+                                log("COPY", sm["symbol"],
+                                    f"COMPRADA {cuanto} — "
+                                    f"{sm['veces']} señales smart money",
+                                    {"tx": str(res.get("tx") or "")[:80]})
+                                time.sleep(AUTO_CADA)
+                                continue     # una operación por ronda
+                            except Exception as e:
+                                log("COPY_FAIL", sm["symbol"], str(e)[:160])
+                        else:
+                            log("COPY_SKIP", sm["symbol"], nota)
+
+                acciones = [d for d in (r.get("decisions") or [])
+                            if (d.get("decision") or {}).get("action") == "ACTION"]
+                # Se reevalúa el riesgo AHORA (con las posiciones ya
+                # sincronizadas), en vez de fiarse del `risk_warn` que venía
+                # calculado con los fantasmas dentro.
+                acciones.sort(key=lambda d: (d.get("decision") or {}).get("priority", 0),
+                              reverse=True)
+                for d in acciones[:1]:
+                    dec = d["decision"]
+                    cuanto = tamano_auto(chain)
+                    if cuanto > 0:
+                        dec["size_sol"] = cuanto
+                    permite, nota = (ST.risk.gate(
+                        dec["size_sol"], len(ST.positions), ST.exposure())
+                        if cuanto > 0 else (False, "sin saldo suficiente"))
+                    if not permite:
+                        log("AUTO_SKIP", str(dec.get("symbol")), nota)
+                        break
+                    try:
+                        res = do_buy(chain, dec["address"], dec["size_sol"])
+                        # ☠️ `log(..., extra)` hace `dict(..., **extra)`: si
+                        # `extra` trae una clave que ya usa la propia función
+                        # (action, symbol, reason, mode, ts) revienta con
+                        # "dict() got multiple values for keyword argument".
+                        # Pasarle `res` crudo tumbó la compra de BUCKET el
+                        # 31/08 — la orden salió pero el registro falló.
+                        log("AUTO", str(dec.get("symbol")),
+                            f"COMPRADA {dec['size_sol']} ({chain})",
+                            {"tx": str(res.get("tx") or res.get("hash") or "")[:80]})
+                    except Exception as e:
+                        log("AUTO_FAIL", dec.get("symbol"), str(e)[:160])
+            except Exception as e:
+                log("AUTO_FAIL", "-", str(e)[:160])
+            time.sleep(AUTO_CADA)
+
+    threading.Thread(target=bucle, daemon=True).start()
+    log("AUTO", "-", f"trading autónomo ACTIVO · ciclo {AUTO_CADA}s · corte -50%")
 
 
 @app.on_event("startup")
