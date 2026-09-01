@@ -62,7 +62,7 @@ CFG = {
     # qué señales funcionan sin quemar el saldo en dos operaciones.
     "equity_sol": 0.37,        # saldo real medido 01/09 (~$38)
     "risk_per_trade": 0.21,    # 0.21*0.37/0.35 = ~0.22 SOL -> tope lo baja a 0.19
-    "hard_stop_pct": 0.35,
+    "hard_stop_pct": 0.25,
     "max_per_trade_sol": 0.19,        # ~$20 por moneda (SOL a $103, medido)
     "max_total_exposure_sol": 0.30,   # nunca más de la mitad del saldo fuera
     "max_concurrent_positions": 4,    # 4 × 0,05 = 0,2 SOL comprometidos
@@ -137,8 +137,8 @@ CFG = {
     "buy_ratio_pass": 0.50,          # 买盘占优 → 可 pass（即使暴涨/late 也跟金狗）
     "buy_ratio_reject": 0.42,        # 卖压主导 → 判派发/接盘位，reject
     # 退出阶梯
-    "tp_ladder": [(0.60, 0.40), (1.50, 0.30)],
-    "trailing_pct": 0.25,
+    "tp_ladder": [(0.30, 0.50), (0.80, 0.50)],
+    "trailing_pct": 0.15,
     # 逃生预警阈值（severity 0-100）
     "escape_severity": 70,
 }
@@ -2315,7 +2315,7 @@ def api_ops(limit: int = 40):
                 continue
             if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
                                    "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
-                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL", "PRECIOS_FAIL", "PRECIO_VIEJO", "CLAUDE_VETO",
+                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL", "PRECIOS_FAIL", "PRECIO_VIEJO", "CLAUDE_VETO", "CLAUDE_LENTO",
                                    "VENTA_EXTERNA", "VENTA_FAIL",
                                    "PIRAMIDE", "PIRAMIDE_FAIL"):
                 out.append(d)
@@ -2829,9 +2829,14 @@ _HIST_CACHE = {"t": 0.0, "ops": []}
 
 
 def _historial_para_claude() -> list[dict]:
-    """Últimos cierres reales, cacheados 10 min (leerlos cuesta ~3 min)."""
-    if time.time() - _HIST_CACHE["t"] < 600:
-        return _HIST_CACHE["ops"]
+    """Últimos cierres YA CALCULADOS. Nunca calcula aquí: leer la cadena
+    tarda ~3 min y bloquearía la consulta a Claude (que solo necesita
+    9-11s, medido). Lo refresca `_hilo_historial` en segundo plano."""
+    return _HIST_CACHE["ops"]
+
+
+def _refrescar_historial() -> list[dict]:
+    """Cálculo real. Solo lo llama el hilo de fondo."""
     try:
         r = subprocess.run(
             [str(HERE / "venv" / "bin" / "python3"), str(HERE / "aprender.py"), "--json"],
@@ -2842,6 +2847,17 @@ def _historial_para_claude() -> list[dict]:
         ops = []
     _HIST_CACHE.update({"t": time.time(), "ops": ops})
     return ops
+
+
+def _hilo_historial():
+    """Refresca el historial que ve Claude cada 20 min, en su propio hilo."""
+    time.sleep(60)
+    while True:
+        try:
+            _refrescar_historial()
+        except Exception:
+            pass
+        time.sleep(1200)
 
 
 def veto_de_claude(dec: dict) -> tuple[bool, str]:
@@ -2868,14 +2884,33 @@ def veto_de_claude(dec: dict) -> tuple[bool, str]:
         "snipers": f.get("sniper_count"),
         "rug_ratio_pct": round((f.get("rug") or 0) * 100),
     }
-    try:
-        import juez_claude
-        v = juez_claude.preguntar(datos, _historial_para_claude())
-    except Exception as e:
-        return True, f"claude no disponible ({str(e)[:30]})"
+    # ☠️ 25s de techo. Medido: una consulta tardó 64s y ese tiempo bloquea
+    # el bucle entero mientras el precio se mueve. Si Claude no contesta a
+    # tiempo, se compra con los filtros propios (que ya son estrictos).
+    resultado = {}
+
+    def _consultar():
+        try:
+            import juez_claude
+            resultado.update(juez_claude.preguntar(datos, _historial_para_claude()))
+        except Exception as e:
+            resultado.update({"ok": False, "motivo": str(e)[:40]})
+
+    h = threading.Thread(target=_consultar, daemon=True)
+    h.start()
+    h.join(timeout=30)
+    if not resultado:
+        log("CLAUDE_LENTO", str(dec.get("symbol")), "sin respuesta en 25s")
+        return True, ""
+    v = resultado
     if not v.get("ok"):
         return True, ""
-    return bool(v.get("comprar")), str(v.get("motivo", ""))
+    # Veto SOLO con convicción alta. Con confianza media Claude rechazaba
+    # también candidatas sanas (probado 01/09) y el sistema se quedaba sin
+    # operar: un juez que dice "no" a todo no filtra, paraliza.
+    if not v.get("comprar") and float(v.get("confianza", 0)) >= 0.70:
+        return False, str(v.get("motivo", ""))
+    return True, str(v.get("motivo", ""))
 
 
 def porque_compra(dec: dict) -> str:
@@ -3311,6 +3346,7 @@ def _auto_trader():
 
     threading.Thread(target=bucle, daemon=True).start()
     threading.Thread(target=_hilo_precios, daemon=True).start()
+    threading.Thread(target=_hilo_historial, daemon=True).start()
     threading.Thread(target=_guardian_posiciones, daemon=True).start()
     log("SISTEMA", "-", f"motor arrancado · ronda {AUTO_CADA:.0f}s · corte -{MAX_DRAWDOWN*100:.0f}%")
 
