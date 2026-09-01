@@ -90,6 +90,11 @@ CFG = {
     # tras entrar en pumps de +100% a +300% en 5 min. "Eras la salida de
     # otro": la esperanza matemática de comprar en la vela 3+ de un pump es
     # negativa. Se compra la aceleración temprana, no la extensión.
+    # Javi (01/09): "no compres por encima de 1M, el potencial es una
+    # mierda". Cierto: de 30k a 300k es un x10; de 1M a 10M hacen falta
+    # 9M de dinero nuevo entrando. Medido sobre 100 tokens reales: el tope
+    # deja pasar 80, así que filtra el 20% grande sin ahogar el embudo.
+    "max_mcap_entrada": 1_000_000,
     "max_chg_5m_entrada": 0.50,     # >+50% en 5m = pump ya consumido
     # ☠️ NO ES compras/ventas. Medido sobre 100 tokens reales de GMGN:
     # mediana 0.53, percentil 95 = 0.72, MÁXIMO 0.92 — nunca pasa de 1.
@@ -946,6 +951,9 @@ def hard_gates(f: TokenFeatures, chain: str = "sol"):
         return False, f"REJECT 避雷：税过高 买{f.buy_tax:.0%}/卖{f.sell_tax:.0%}", 1
     if f.rug_ratio > CFG["max_rug_ratio"]:
         return False, f"REJECT 避雷：rug 比例 {f.rug_ratio:.0%} > {CFG['max_rug_ratio']:.0%}", 1
+    if f.mcap and f.mcap > CFG["max_mcap_entrada"]:
+        return False, (f"REJECT cap alto: ${f.mcap:,.0f} > "
+                       f"${CFG['max_mcap_entrada']:,.0f} (poco recorrido)"), 1
     # ☠️ TECHO DE MOMENTUM: llegar tarde a un pump es la causa medida de
     # las 3 perdedoras del 01/09 (-23%, -23%, -36%, todas en <8 min).
     if f.chg_5m > CFG["max_chg_5m_entrada"]:
@@ -2848,6 +2856,14 @@ def copiar_wallets(chain: str) -> dict | None:
             addr = tok.get("address")
             if not addr or any(p.get("address") == addr for p in ST.positions):
                 continue
+            # Que una wallet buena compre NO impide que el token sea un rug
+            # ni que el cap ya esté agotado: filtros también aquí.
+            cap = _f(tok.get("market_cap"))
+            if cap and cap > CFG["max_mcap_entrada"]:
+                _COPIADAS.add(tx)
+                log("COPIA_SKIP", tok.get("symbol") or addr[:6],
+                    f"cap ${cap:,.0f} > ${CFG['max_mcap_entrada']:,.0f}")
+                continue
             _COPIADAS.add(tx)
             return {"address": addr,
                     "symbol": tok.get("symbol") or addr[:6],
@@ -2904,8 +2920,11 @@ def señal_smart_money(chain: str) -> dict | None:
         bundle = _f(d.get("bundler_rate"))
         top10 = _f(d.get("top_10_holder_rate"))
         rug = _f(d.get("rug_ratio"))
+        mcap_sm = _f(d.get("market_cap"))
         malo = None
-        if bundle > CFG["max_bundler_ratio"]:
+        if mcap_sm > CFG["max_mcap_entrada"]:
+            malo = f"cap ${mcap_sm:,.0f} > ${CFG['max_mcap_entrada']:,.0f}"
+        elif bundle > CFG["max_bundler_ratio"]:
             malo = f"bundlers {bundle:.0%}"
         elif top10 > CFG.get("max_top10", 0.60):
             malo = f"top10 {top10:.0%}"
