@@ -2813,6 +2813,78 @@ def wallets_seguidas(chain: str) -> list[str]:
 COPIA_MAX_EDAD_S = 420      # 7 min: más viejo y el precio ya no es el suyo
 
 
+def copiar_follow_wallet(chain: str) -> dict | None:
+    """Copia las compras de las wallets que Javi sigue en GMGN.
+
+    ── HALLAZGO 01/09 ─────────────────────────────────────────────────────
+    `track follow-wallet` devuelve `list: null` en **sol**, pero FUNCIONA en
+    robinhood / bsc / base / eth. Ahí estaban las 13 wallets que Javi siguió
+    tras mirar 30 días. Y en UNA sola llamada trae las operaciones de TODAS:
+    mucho más barato que consultar wallet por wallet (1 llamada vs 6) y sin
+    lista que mantener a mano — si Javi sigue a alguien nuevo en la web,
+    aparece solo.
+
+    Filtros (los mismos de siempre, que una wallet buena no vuelve sano un
+    token podrido):
+      · solo `side == buy` de menos de 7 min
+      · market cap < 1M (calculado: total_supply x price_usd)
+      · cada tx se copia UNA vez
+      · descarta si el precio ya subió >25% desde que ella entró: a esa
+        altura estás comprando su beneficio, no su idea
+    """
+    g = ST.adapter_for(chain)
+    if not hasattr(g, "_cli"):
+        return None
+    try:
+        r = g._cli("track", "follow-wallet", "--chain", chain, "--limit", "50")
+    except Exception:
+        return None
+    ahora = time.time()
+    for t in (r.get("list") or []):
+        if (t.get("side") or "").lower() != "buy":
+            continue
+        tx = t.get("transaction_hash") or t.get("id") or ""
+        if not tx or tx in _COPIADAS:
+            continue
+        edad = ahora - float(t.get("timestamp") or 0)
+        if edad > COPIA_MAX_EDAD_S:
+            continue
+        addr = t.get("base_address")
+        if not addr or any(q.get("address") == addr for q in ST.positions):
+            continue
+        tok = t.get("base_token") or {}
+        sym = tok.get("symbol") or addr[:6]
+
+        # cap = supply x precio actual (la API no lo da hecho aquí)
+        cap = 0.0
+        try:
+            cap = float(tok.get("total_supply") or 0) * float(t.get("price_now") or 0)
+        except Exception:
+            pass
+        if cap and cap > CFG["max_mcap_entrada"]:
+            _COPIADAS.add(tx)
+            log("COPIA_SKIP", sym, f"cap ${cap:,.0f} > ${CFG['max_mcap_entrada']:,.0f}")
+            continue
+
+        # ¿ya se ha ido el precio desde que ella compró?
+        try:
+            subida = float(t.get("price_now") or 0) / float(t.get("price_usd") or 0) - 1
+        except Exception:
+            subida = 0.0
+        if subida > 0.25:
+            _COPIADAS.add(tx)
+            log("COPIA_SKIP", sym, f"ya subió {subida*100:+.0f}% desde su entrada")
+            continue
+
+        _COPIADAS.add(tx)
+        return {"address": addr, "symbol": sym,
+                "wallet": t.get("maker") or "?",
+                "hace_min": round(edad / 60, 1),
+                "subida_pct": round(subida * 100),
+                "cap": cap}
+    return None
+
+
 def copiar_wallets(chain: str) -> dict | None:
     """Copia la última COMPRA de las wallets que Javi sigue.
 
@@ -3423,7 +3495,9 @@ def _auto_trader():
                 # ── COPIAR WALLETS SEGUIDAS: prioridad máxima, son las
                 # que Javi ha elegido a mano tras mirar 30 días.
                 try:
-                    cw = copiar_wallets(chain)
+                    # follow-wallet cubre robinhood/bsc/base/eth en 1 llamada;
+                    # en sol devuelve null -> lista manual del JSON.
+                    cw = copiar_follow_wallet(chain) or copiar_wallets(chain)
                 except Exception as e:
                     cw = None
                     log("COPIA_FAIL", "-", str(e)[:120])
