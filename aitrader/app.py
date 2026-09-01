@@ -191,7 +191,11 @@ AUTO_TRADE = True
 _CLI_LOCK = threading.Lock()
 _CLI_ULTIMA = {"t": 0.0, "ban_hasta": 0.0}
 AUTO_CADA = 300.0        # una ronda cada 3 min, alternando sol/robinhood
-MAX_DRAWDOWN = 0.50      # "hasta que pierda el 50%"
+# Javi (01/09, fase de pruebas): "me da igual perder dinero mientras
+# aprenda". El -50% paró el sistema a las 21:39 con 51% de caída. Se sube
+# a 80% para que siga generando muestra; sigue siendo un tope real para
+# que nunca llegue a cero y quede algo con lo que operar.
+MAX_DRAWDOWN = 0.80
 
 # 公开演示（只读广播）：设环境变量 PUBLIC_DEMO=1 开启。用于把看板挂公网给不特定访客看
 # 真实筛选数据，同时把后端收敛成纯只读：
@@ -2916,11 +2920,42 @@ def copiar_follow_wallet(chain: str) -> dict | None:
             log("COPIA_SKIP", sym, f"ya subió {subida*100:+.0f}% desde su entrada")
             continue
 
+        # ☠️ ESTA RUTA SOLO MIRABA EL CAP. Javi lo cazó el 01/09: PIPE se
+        # copió con bundle evidente porque aquí no se consultaba NADA de
+        # seguridad. Que una wallet buena compre no vuelve sano el token:
+        # ella entra con tesis y salida propias, tú entras a ciegas.
+        # Mismos filtros que el screener, sin excepciones.
+        try:
+            sec = g.token_security(addr) or {}
+        except Exception:
+            sec = {}
+        riesgo = _security_unsafe(sec, chain)
+        if riesgo:
+            _COPIADAS.add(tx)
+            log("COPIA_SKIP", sym, f"seguridad: {riesgo}")
+            continue
+        bundle_c = _f(sec.get("bundler_rate") or sec.get("bundler"))
+        if bundle_c > CFG["max_bundler_ratio"]:
+            _COPIADAS.add(tx)
+            log("COPIA_SKIP", sym, f"bundlers {bundle_c:.0%} > {CFG['max_bundler_ratio']:.0%}")
+            continue
+        top10_c = _f(sec.get("top10") or sec.get("top_10_holder_rate"))
+        if top10_c > CFG.get("max_top10", 0.60):
+            _COPIADAS.add(tx)
+            log("COPIA_SKIP", sym, f"top10 {top10_c:.0%} concentrado")
+            continue
+        rug_c = _f(sec.get("rug_ratio") or sec.get("rug"))
+        if rug_c > 0.60:
+            _COPIADAS.add(tx)
+            log("COPIA_SKIP", sym, f"rug ratio {rug_c:.0%}")
+            continue
+
         _COPIADAS.add(tx)
         return {"address": addr, "symbol": sym,
                 "wallet": t.get("maker") or "?",
                 "hace_min": round(edad / 60, 1),
                 "subida_pct": round(subida * 100),
+                "bundle": bundle_c, "top10": top10_c,
                 "cap": cap}
     return None
 
@@ -3557,7 +3592,8 @@ def _auto_trader():
                             res = do_buy(chain, cw["address"], cuanto)
                             log("COPIA_WALLET", cw["symbol"],
                                 f"COPIADA {cuanto} — la compró {cw['wallet'][:8]}… "
-                                f"hace {cw['hace_min']} min",
+                                f"hace {cw['hace_min']} min · cap ${cw.get('cap') or 0:,.0f} "
+                                f"· bundle {(cw.get('bundle') or 0)*100:.0f}%",
                                 {"tx": str(res.get("tx") or "")[:80]})
                             continue
                         except Exception as e:
