@@ -2290,7 +2290,7 @@ def api_ops(limit: int = 40):
                 continue
             if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
                                    "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
-                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL", "PRECIOS_FAIL", "PRECIO_VIEJO",
+                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL", "PRECIOS_FAIL", "PRECIO_VIEJO", "CLAUDE_VETO",
                                    "VENTA_EXTERNA", "VENTA_FAIL",
                                    "PIRAMIDE", "PIRAMIDE_FAIL"):
                 out.append(d)
@@ -2796,6 +2796,60 @@ def señal_smart_money(chain: str) -> dict | None:
     return None
 
 
+USAR_CLAUDE = True           # Javi (01/09): "métele por detrás Claude"
+_HIST_CACHE = {"t": 0.0, "ops": []}
+
+
+def _historial_para_claude() -> list[dict]:
+    """Últimos cierres reales, cacheados 10 min (leerlos cuesta ~3 min)."""
+    if time.time() - _HIST_CACHE["t"] < 600:
+        return _HIST_CACHE["ops"]
+    try:
+        r = subprocess.run(
+            [str(HERE / "venv" / "bin" / "python3"), str(HERE / "aprender.py"), "--json"],
+            capture_output=True, text=True, timeout=200, cwd=str(HERE),
+            env={**os.environ, "PYTHONPATH": ""})
+        ops = json.loads(r.stdout).get("operaciones") or []
+    except Exception:
+        ops = []
+    _HIST_CACHE.update({"t": time.time(), "ops": ops})
+    return ops
+
+
+def veto_de_claude(dec: dict) -> tuple[bool, str]:
+    """Segunda opinión de Claude. Devuelve (comprar, motivo).
+
+    Claude SOLO PUEDE VETAR: los filtros de seguridad ya han corrido antes
+    y son innegociables. Si Claude falla o tarda, se compra igual —un juez
+    opcional no puede ser un punto único de fallo.
+    """
+    if not USAR_CLAUDE:
+        return True, ""
+    f = dec.get("features") or {}
+    datos = {
+        "edad_minutos": f.get("age_min"),
+        "market_cap_usd": f.get("mcap"),
+        "liquidez_usd": f.get("liquidity"),
+        "bundle_pct": round((f.get("bundler") or 0) * 100),
+        "top10_pct": round((f.get("top10") or 0) * 100),
+        "dev_holding_pct": round((f.get("dev_hold") or 0) * 100),
+        "cambio_5m_pct": round((f.get("chg_5m") or 0) * 100),
+        "cambio_1h_pct": round((f.get("chg_1h") or 0) * 100),
+        "ratio_compra_venta": f.get("buy_ratio"),
+        "smart_money_dentro": f.get("sm_confluence"),
+        "snipers": f.get("sniper_count"),
+        "rug_ratio_pct": round((f.get("rug") or 0) * 100),
+    }
+    try:
+        import juez_claude
+        v = juez_claude.preguntar(datos, _historial_para_claude())
+    except Exception as e:
+        return True, f"claude no disponible ({str(e)[:30]})"
+    if not v.get("ok"):
+        return True, ""
+    return bool(v.get("comprar")), str(v.get("motivo", ""))
+
+
 def porque_compra(dec: dict) -> str:
     """El PORQUÉ de una compra, en una frase que Javi pueda leer.
 
@@ -3201,6 +3255,12 @@ def _auto_trader():
                         log("AUTO_SKIP", str(dec.get("symbol")), nota)
                         break
                     try:
+                        ok_claude, motivo_c = veto_de_claude(dec)
+                        if not ok_claude:
+                            log("CLAUDE_VETO", str(dec.get("symbol")),
+                                f"NO COMPRADA — {motivo_c}")
+                            time.sleep(AUTO_CADA)
+                            continue
                         res = do_buy(chain, dec["address"], dec["size_sol"])
                         # ☠️ `log(..., extra)` hace `dict(..., **extra)`: si
                         # `extra` trae una clave que ya usa la propia función

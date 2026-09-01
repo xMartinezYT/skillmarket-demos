@@ -250,6 +250,29 @@ def analizar(cerradas: list[dict]) -> dict:
                 "ajuste": f"dar más peso a {mejor}: subir su tamaño de posición "
                           f"o darle más turnos por ronda"})
 
+    # ── APRENDER DE LOS ERRORES: si las perdedoras comparten un patrón,
+    # proponer el ajuste concreto. Medido el 01/09: las 3 perdedoras del
+    # sistema nuevo murieron en 3-8 min -> el criterio deja entrar tokens
+    # que se desploman al instante, no es mala suerte.
+    perd = [c for c in cerradas if c["pnl"] <= 0]
+    if len(perd) >= 3:
+        rapidas = [c for c in perd if (c.get("minutos_dentro") or 0) < 15]
+        if len(rapidas) >= max(3, int(len(perd) * 0.6)):
+            res["propuestas"].append({
+                "que": "las perdedoras mueren en minutos, no es mala suerte",
+                "dato": f"{len(rapidas)} de {len(perd)} perdedoras cerraron en "
+                        f"<15 min (mediana {sorted(c.get('minutos_dentro',0) for c in rapidas)[len(rapidas)//2]:.0f} min)",
+                "ajuste": "está entrando TARDE en pumps ya consumidos: exigir "
+                          "momentum 5m MENOR (no perseguir lo que ya subió) y "
+                          "edad mínima del token"})
+        muy_malas = [c for c in perd if c["pnl"] < -0.30]
+        if len(muy_malas) >= 3:
+            res["propuestas"].append({
+                "que": "el stop no está conteniendo",
+                "dato": f"{len(muy_malas)} cierres por debajo de -30%",
+                "ajuste": "revisar que el guardián evalúe cada 45s y que el "
+                          "precio del store no sea rancio"})
+
     if n < MIN_CERRADAS:
         res["veredicto"] = (f"Solo {n} operaciones cerradas — con menos de "
                             f"{MIN_CERRADAS} cualquier ajuste es ruido. Sigo mirando.")
