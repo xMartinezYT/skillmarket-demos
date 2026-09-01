@@ -2467,6 +2467,57 @@ def sincronizar_posiciones() -> int:
     return fuera
 
 
+PIRAMIDE_MIN = 0.25      # +25%: la subida confirma el pronostico -> se añade
+PIRAMIDE_MAX = 0.80      # por encima de +80% ya es tarde: seria comprar el pico
+_PIRAMIDADAS: set = set()
+
+
+def piramidar_si_confirma(chain: str) -> bool:
+    """Javi (01/09): "que pueda meter más si ve que la coin sube con su
+    pronóstico". Una posición que va +25% VALIDA la tesis de entrada; se
+    añade una segunda entrada del mismo tamaño estándar.
+
+    Límites duros (para que confirmar no se convierta en perseguir):
+      · UNA ampliación por token, nunca más (set en memoria + no repite).
+      · Solo entre +25% y +80%: antes es ruido, después es FOMO.
+      · Pasa por el MISMO gate de riesgo y el MISMO do_buy con TP/SL
+        adjuntos que cualquier compra — la ampliación queda protegida.
+      · El pnl sale de DexScreener (gratis), no gasta cuota de GMGN.
+    """
+    for pos in list(ST.positions):
+        if pos.get("chain", "sol") != chain:
+            continue
+        addr = pos.get("address") or ""
+        if not addr or addr in _PIRAMIDADAS:
+            continue
+        ep = pos.get("entry_price") or 0
+        if not ep:
+            continue
+        cur = _precio_dexscreener(addr)
+        if not cur:
+            continue
+        pnl = cur / ep - 1
+        if not (PIRAMIDE_MIN <= pnl <= PIRAMIDE_MAX):
+            continue
+        cuanto = tamano_auto(chain)
+        if cuanto <= 0:
+            continue
+        permite, nota = ST.risk.gate(cuanto, len(ST.positions), ST.exposure())
+        if not permite:
+            log("PIRAMIDE_SKIP", pos.get("symbol"), nota)
+            continue
+        try:
+            res = do_buy(chain, addr, cuanto)
+            _PIRAMIDADAS.add(addr)
+            log("PIRAMIDE", pos.get("symbol"),
+                f"AMPLIADA {cuanto} — iba {pnl*100:+.0f}% y confirma el pronóstico",
+                {"tx": str(res.get("tx") or "")[:80]})
+            return True
+        except Exception as e:
+            log("PIRAMIDE_FAIL", pos.get("symbol"), str(e)[:160])
+    return False
+
+
 COPYTRADE = True         # Javi (01/09): "trading y copytrading"
 COPY_MC_MIN = 8_000      # mismo suelo de cap que el screener normal
 COPY_MAX_SIG_AGE = 600   # señales de hace >10 min: el tren ya pasó
@@ -2603,6 +2654,13 @@ def _auto_trader():
                 # Limpia posiciones ya cerradas en GMGN ANTES de mirar las
                 # candidatas: si no, la exposición fantasma bloquea todo.
                 sincronizar_posiciones()
+
+                # ── PIRAMIDADO: ampliar lo que ya está funcionando va
+                # ANTES que abrir nada nuevo — es la señal más barata y
+                # más verificada que existe (tu propia posición ganando).
+                if piramidar_si_confirma(chain):
+                    time.sleep(AUTO_CADA)
+                    continue         # una operación por ronda
 
                 # ── COPYTRADING (Javi, 01/09): si hay cluster-buy de smart
                 # money, va PRIMERO — el dinero listo comprando a la vez es
