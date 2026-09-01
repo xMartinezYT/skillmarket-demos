@@ -1950,7 +1950,9 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
 
     ST.positions.append(dict(symbol=symbol, address=address, size_sol=round(size_sol, 4),
                              pnl=0.0, cycles=0, entry=entry, chain=chain,
-                             entry_price=entry_price, cur_price=entry_price))
+                             entry_price=entry_price, cur_price=entry_price,
+                             ts=time.time()))  # cuándo se abrió: lo usa el
+                                               # criterio de "tiempo muerto"
     save_positions()
     _verb = "成交" if filled else ("提交·待确认" if ST.mode == "LIVE" else "记录")
     log("BUY", symbol, f"{ST.mode} {_verb} {size_sol} ({chain})", dict(size_sol=size_sol, chain=chain, **exit_plan()))
@@ -2467,6 +2469,69 @@ def sincronizar_posiciones() -> int:
     return fuera
 
 
+_PICOS: dict = {}          # address -> pnl maximo visto (para el trailing local)
+
+
+def vender_si_toca(chain: str) -> bool:
+    """Venta por CRITERIO PROPIO, sin esperar a los TP/SL fijos de GMGN.
+
+    Javi (01/09): "que venda y compre cuando él crea". Las compras ya son
+    suyas (screener + copy + pirámide); esto le da la salida discrecional.
+
+    Tres razones para vender, cada una medida (precio DexScreener, gratis):
+      1. TRAILING LOCAL: cayó >25% desde el mejor pnl visto estando en
+         positivo — proteger la ganancia sin esperar al trailing de GMGN
+         (que exige +150% para armarse).
+      2. STOP DE RESPALDO: pnl < -35%. Si la orden de GMGN falla o no se
+         registró (pasó el 31/08 con bucket: -72% sin que saltara nada),
+         este es el paracaídas local.
+      3. TIEMPO MUERTO: >120 min sin pasar del +10% — capital bloqueado en
+         algo que no confirma; mejor libre para la siguiente señal.
+
+    Los TP/SL de GMGN SIGUEN puestos: esto añade criterio, no lo sustituye.
+    """
+    for pos in list(ST.positions):
+        if pos.get("chain", "sol") != chain:
+            continue
+        addr = pos.get("address") or ""
+        ep = pos.get("entry_price") or 0
+        if not addr or not ep:
+            continue
+        cur = _precio_dexscreener(addr)
+        if not cur:
+            continue
+        pnl = cur / ep - 1
+        pico = max(_PICOS.get(addr, 0.0), pnl)
+        _PICOS[addr] = pico
+
+        motivo = None
+        if pico > 0.15 and (pico - pnl) > 0.25:
+            motivo = (f"trailing propio: tocó {pico*100:+.0f}% y ha devuelto "
+                      f"{(pico-pnl)*100:.0f} puntos")
+        elif pnl < -0.35:
+            motivo = f"stop de respaldo: {pnl*100:+.0f}% (la orden GMGN no saltó)"
+        else:
+            comprada = pos.get("ts") or pos.get("t") or 0
+            try:
+                mins = (time.time() - float(comprada)) / 60 if comprada else 0
+            except Exception:
+                mins = 0
+            if mins > 120 and pico < 0.10:
+                motivo = f"tiempo muerto: {mins:.0f} min sin pasar del +10%"
+
+        if not motivo:
+            continue
+        try:
+            do_sell(addr)
+            _PICOS.pop(addr, None)
+            log("VENTA_PROPIA", pos.get("symbol"),
+                f"VENDIDA a {pnl*100:+.0f}% — {motivo}")
+            return True
+        except Exception as e:
+            log("VENTA_FAIL", pos.get("symbol"), str(e)[:160])
+    return False
+
+
 PIRAMIDE_MIN = 0.25      # +25%: la subida confirma el pronostico -> se añade
 PIRAMIDE_MAX = 0.80      # por encima de +80% ya es tarde: seria comprar el pico
 _PIRAMIDADAS: set = set()
@@ -2654,6 +2719,12 @@ def _auto_trader():
                 # Limpia posiciones ya cerradas en GMGN ANTES de mirar las
                 # candidatas: si no, la exposición fantasma bloquea todo.
                 sincronizar_posiciones()
+
+                # ── VENTA POR CRITERIO: lo primero de cada ronda es
+                # decidir si algo de lo abierto ya no merece seguir abierto.
+                if vender_si_toca(chain):
+                    time.sleep(AUTO_CADA)
+                    continue         # una operación por ronda
 
                 # ── PIRAMIDADO: ampliar lo que ya está funcionando va
                 # ANTES que abrir nada nuevo — es la señal más barata y
