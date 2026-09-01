@@ -2329,9 +2329,26 @@ def _precio_dexscreener(mint: str) -> float | None:
     return precio
 
 
+_SYNC_UI = {"t": 0.0}
+
+
 @app.get("/api/positions_light")
 def api_positions_light():
-    """Posiciones para la UI: rápidas Y con pnl vivo (DexScreener, no GMGN)."""
+    """Posiciones para la UI: rápidas Y con pnl vivo (DexScreener, no GMGN).
+
+    ☠️ "Cierra posiciones pero siguen saliendo": cuando vende el TP/SL
+    REMOTO de GMGN (no do_sell), nadie borraba la posición local hasta la
+    ronda del bot (cada 5 min) — y si el bot estaba escaneando, más. La
+    limpieza corre ahora TAMBIÉN aquí, con freno de 45s: la UI refresca
+    cada 15s pero verificar contra la cadena cada vez sería castigar al
+    RPC gratis que nos sostiene.
+    """
+    if time.time() - _SYNC_UI["t"] > 45:
+        _SYNC_UI["t"] = time.time()
+        try:
+            sincronizar_posiciones()
+        except Exception:
+            pass
     out = []
     for p in ST.positions:
         pnl = p.get("pnl", 0)
