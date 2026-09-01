@@ -193,7 +193,7 @@ async function pintaOps() {
     $("ops").innerHTML = `<table><tr><th>HORA</th><th>QUÉ</th><th>TOKEN</th><th>DETALLE</th></tr>` +
       ops.map(o => {
         const cls = o.action === "COPY" ? "copy"
-          : (o.action === "BUY" || o.action === "AUTO" || o.action === "PIRAMIDE") ? "buy"
+          : (o.action === "BUY" || o.action === "AUTO" || o.action === "PIRAMIDE" || o.action === "COPIA_WALLET") ? "buy"
           : (o.action === "VENTA_PROPIA" || o.action === "VENTA_EXTERNA" || o.action === "SELL") ? "copy"
           : o.action.includes("FAIL") ? "fail" : "";
         // SISTEMA no lleva color: es info, no una operación
@@ -206,7 +206,8 @@ async function pintaOps() {
           : o.action.includes("SKIP") ? "PASA"
           : o.action.includes("FAIL") ? "FALLO"
           : o.action === "SYNC" ? "LIMPIEZA"
-          : o.action === "SISTEMA" ? "SISTEMA" : o.action;
+          : o.action === "SISTEMA" ? "SISTEMA"
+          : o.action === "COPIA_WALLET" ? "COPIA·WALLET" : o.action;
         return `<tr>
           <td class="gris">${hora(o.ts)}</td>
           <td><span class="chip ${cls}">${nombre}</span></td>

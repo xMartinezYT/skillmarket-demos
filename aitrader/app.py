@@ -2325,7 +2325,7 @@ def api_ops(limit: int = 40):
                 continue
             if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
                                    "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
-                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL", "PRECIOS_FAIL", "PRECIO_VIEJO", "CLAUDE_VETO", "CLAUDE_LENTO",
+                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL", "PRECIOS_FAIL", "PRECIO_VIEJO", "CLAUDE_VETO", "CLAUDE_LENTO", "COPIA_WALLET", "COPIA_SKIP", "COPIA_FAIL",
                                    "VENTA_EXTERNA", "VENTA_FAIL",
                                    "PIRAMIDE", "PIRAMIDE_FAIL"):
                 out.append(d)
@@ -2779,6 +2779,81 @@ COPYTRADE = True         # Javi (01/09): "trading y copytrading"
 COPY_MC_MIN = 8_000      # mismo suelo de cap que el screener normal
 COPY_MAX_SIG_AGE = 600   # señales de hace >10 min: el tren ya pasó
 _COPY_VISTOS: set = set()
+
+
+WALLETS_FILE = HERE / "wallets_seguidas.json"
+_COPIADAS: set = set()          # tx ya copiadas (no repetir la misma compra)
+_WALLETS_CACHE = {"t": 0.0, "d": {}}
+
+
+def wallets_seguidas(chain: str) -> list[str]:
+    """Wallets que Javi sigue, releídas del JSON cada 5 min.
+
+    Se puede editar el fichero con el bot EN MARCHA: no hace falta
+    reiniciar, la próxima ronda ya usa la lista nueva.
+    """
+    if time.time() - _WALLETS_CACHE["t"] > 300:
+        try:
+            _WALLETS_CACHE["d"] = json.loads(WALLETS_FILE.read_text())
+        except Exception:
+            _WALLETS_CACHE["d"] = {}
+        _WALLETS_CACHE["t"] = time.time()
+    v = _WALLETS_CACHE["d"].get(chain) or []
+    return [w for w in v if isinstance(w, str) and len(w) > 30]
+
+
+COPIA_MAX_EDAD_S = 420      # 7 min: más viejo y el precio ya no es el suyo
+
+
+def copiar_wallets(chain: str) -> dict | None:
+    """Copia la última COMPRA de las wallets que Javi sigue.
+
+    ── POR QUÉ ASÍ ────────────────────────────────────────────────────────
+    `track follow-wallet` devuelve `list: null` aunque Javi haya seguido
+    wallets en la web (verificado el 01/09 con --side, --limit y sin
+    filtros; la API ve la cuenta correcta, pero no expone los seguidos).
+    `portfolio activity --wallet <dir>` SÍ funciona con cualquier
+    dirección y trae event_type buy/sell, token y timestamp: se leen las
+    wallets directamente, que además deja la lista bajo control de Javi.
+
+    Reglas:
+      · Solo compras (`buy`) de menos de 7 minutos: copiar una entrada
+        vieja es comprar a un precio que el copiado ya no tiene.
+      · Cada tx se copia UNA vez (`_COPIADAS`).
+      · Pasa por los MISMOS filtros de seguridad que todo lo demás: que
+        una wallet buena compre no impide que el token sea un rug.
+    """
+    wallets = wallets_seguidas(chain)
+    if not wallets:
+        return None
+    g = ST.adapter_for(chain)
+    if not hasattr(g, "_cli"):
+        return None
+    ahora = time.time()
+    for w in wallets[:6]:              # tope por ronda: cuota de GMGN
+        try:
+            r = g._cli("portfolio", "activity", "--wallet", w, "--limit", "5")
+        except Exception:
+            continue
+        for a in (r.get("activities") or []):
+            if a.get("event_type") != "buy":
+                continue
+            tx = a.get("tx_hash") or ""
+            if not tx or tx in _COPIADAS:
+                continue
+            edad = ahora - float(a.get("timestamp") or 0)
+            if edad > COPIA_MAX_EDAD_S:
+                continue
+            tok = a.get("token") or {}
+            addr = tok.get("address")
+            if not addr or any(p.get("address") == addr for p in ST.positions):
+                continue
+            _COPIADAS.add(tx)
+            return {"address": addr,
+                    "symbol": tok.get("symbol") or addr[:6],
+                    "wallet": w,
+                    "hace_min": round(edad / 60, 1)}
+    return None
 
 
 def señal_smart_money(chain: str) -> dict | None:
@@ -3325,6 +3400,30 @@ def _auto_trader():
                 if piramidar_si_confirma(chain):
                     time.sleep(AUTO_CADA)
                     continue         # una operación por ronda
+
+                # ── COPIAR WALLETS SEGUIDAS: prioridad máxima, son las
+                # que Javi ha elegido a mano tras mirar 30 días.
+                try:
+                    cw = copiar_wallets(chain)
+                except Exception as e:
+                    cw = None
+                    log("COPIA_FAIL", "-", str(e)[:120])
+                if cw:
+                    cuanto = tamano_auto(chain)
+                    permite, nota = ST.risk.gate(cuanto, len(ST.positions), ST.exposure())
+                    if not permite:
+                        log("COPIA_SKIP", cw["symbol"], nota)
+                    else:
+                        try:
+                            res = do_buy(chain, cw["address"], cuanto)
+                            log("COPIA_WALLET", cw["symbol"],
+                                f"COPIADA {cuanto} — la compró {cw['wallet'][:8]}… "
+                                f"hace {cw['hace_min']} min",
+                                {"tx": str(res.get("tx") or "")[:80]})
+                            time.sleep(AUTO_CADA)
+                            continue
+                        except Exception as e:
+                            log("COPIA_FAIL", cw["symbol"], str(e)[:140])
 
                 # ── COPYTRADING (Javi, 01/09): si hay cluster-buy de smart
                 # money, va PRIMERO — el dinero listo comprando a la vez es
