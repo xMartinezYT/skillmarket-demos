@@ -2319,6 +2319,24 @@ def api_resumen():
 _DEX_CACHE: dict = {}     # mint -> (ts, precio_usd) via DexScreener
 
 
+def _precio_gmgn(mint: str, chain: str) -> float | None:
+    """Precio del MISMO proveedor que fijó el entry_price al comprar.
+
+    ☠️ NO MEZCLAR FUENTES. Medido el 01/09 sobre el mismo token de
+    robinhood: GMGN 5.73e-05 vs DexScreener 9.65e-05 = **68% de diferencia**
+    (distintos pools/decimales). Como `entry_price` lo escribe GMGN al
+    comprar, calcular el pnl con precio de DexScreener inventa un +68%
+    de la nada — y con eso el trailing vende ganancias que no existen o el
+    stop no salta cuando debe. El pnl se calcula SIEMPRE con la fuente que
+    dio la entrada; DexScreener queda solo como respaldo si GMGN falla.
+    """
+    try:
+        v = float(ST.adapter_for(chain).token_price(mint) or 0)
+        return v or None
+    except Exception:
+        return None
+
+
 def _precio_dexscreener(mint: str) -> float | None:
     """Precio actual SIN gastar cuota de GMGN.
 
@@ -2584,7 +2602,8 @@ def vender_si_toca(chain: str) -> bool:
         ep = pos.get("entry_price") or 0
         if not addr or not ep:
             continue
-        cur = _precio_dexscreener(addr)
+        # Misma fuente que el entry_price (GMGN); dex solo si GMGN falla.
+        cur = _precio_gmgn(addr, chain) or _precio_dexscreener(addr)
         if not cur:
             # Sin precio no se puede decidir — pero se DEJA CONSTANCIA, que
             # el silencio es lo que dejó correr las pérdidas del 01/09.
