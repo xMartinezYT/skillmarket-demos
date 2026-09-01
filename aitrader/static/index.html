@@ -193,11 +193,15 @@ async function pintaOps() {
     $("ops").innerHTML = `<table><tr><th>HORA</th><th>QUÉ</th><th>TOKEN</th><th>DETALLE</th></tr>` +
       ops.map(o => {
         const cls = o.action === "COPY" ? "copy"
-          : (o.action === "BUY" || o.action === "AUTO") ? "buy"
+          : (o.action === "BUY" || o.action === "AUTO" || o.action === "PIRAMIDE") ? "buy"
+          : (o.action === "VENTA_PROPIA" || o.action === "VENTA_EXTERNA" || o.action === "SELL") ? "copy"
           : o.action.includes("FAIL") ? "fail" : "";
         const nombre = o.action === "COPY" ? "COPY"
           : (o.action === "BUY" || o.action === "AUTO") ? "COMPRA"
           : o.action === "SELL" ? "VENTA"
+          : o.action === "VENTA_PROPIA" ? "VENTA·BOT"
+          : o.action === "VENTA_EXTERNA" ? "VENTA·TP/SL"
+          : o.action === "PIRAMIDE" ? "AMPLIA"
           : o.action.includes("SKIP") ? "PASA"
           : o.action.includes("FAIL") ? "FALLO"
           : o.action === "SYNC" ? "LIMPIEZA" : o.action;

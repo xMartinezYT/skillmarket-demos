@@ -2272,7 +2272,9 @@ def api_ops(limit: int = 40):
                 continue
             if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
                                    "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
-                                   "SYNC", "BUY_BLOCK"):
+                                   "SYNC", "BUY_BLOCK", "VENTA_PROPIA",
+                                   "VENTA_EXTERNA", "VENTA_FAIL",
+                                   "PIRAMIDE", "PIRAMIDE_FAIL"):
                 out.append(d)
                 if len(out) >= limit:
                     break
@@ -2479,14 +2481,24 @@ def sincronizar_posiciones() -> int:
         if ch == "robinhood":
             return (not rh_ok) or p.get("address") in vivos_rh
         return True                 # cadena desconocida: no tocar
+    cerradas_fuera = [p for p in ST.positions if not _viva(p)]
     ST.positions = [p for p in ST.positions if _viva(p)]
-    fuera = antes - len(ST.positions)
+    fuera = len(cerradas_fuera)
     if fuera:
         try:
             save_positions()
         except Exception:
             pass
-        log("SYNC", "-", f"{fuera} posición(es) cerradas fuera del panel")
+        # ☠️ Javi (01/09): "no me muestra cuando hace ventas tipo take-profit".
+        # Un "SYNC · 1 posición cerrada" no dice NI QUÉ NI A CUÁNTO. Cada
+        # cierre externo (TP/SL de GMGN o venta manual de Javi en la web) se
+        # registra ahora COMO VENTA, con su último pnl conocido — así el
+        # historial cuenta la operación completa aunque no la cerrara el bot.
+        for p in cerradas_fuera:
+            pnl = p.get("pnl", 0) * 100
+            log("VENTA_EXTERNA", p.get("symbol"),
+                f"CERRADA fuera del panel a {pnl:+.0f}% aprox — "
+                f"take-profit/stop de GMGN o venta manual")
     return fuera
 
 
@@ -2778,16 +2790,26 @@ def _auto_trader():
                     ST.risk.halted = True
                     time.sleep(600)
                     continue
-                r = screen_once(chain) or {}
-                # Limpia posiciones ya cerradas en GMGN ANTES de mirar las
-                # candidatas: si no, la exposición fantasma bloquea todo.
+                # ── VENTA POR CRITERIO — ANTES DEL ESCANEO. ☠️ Estaba
+                # después de screen_once(), que tarda MINUTOS (12s/llamada
+                # con el lock cogido): STOCKLY llegó a -50% sin que la venta
+                # se evaluara ni una vez porque la ronda seguía escaneando
+                # monedas nuevas. Proteger lo abierto va SIEMPRE antes que
+                # buscar lo siguiente — vender es barato (DexScreener + 1
+                # swap), mirar es caro.
                 sincronizar_posiciones()
-
-                # ── VENTA POR CRITERIO: lo primero de cada ronda es
-                # decidir si algo de lo abierto ya no merece seguir abierto.
-                if vender_si_toca(chain):
+                # Las DOS cadenas, no solo la del turno: con turnos alternos,
+                # una posición sangrando en robinhood esperaba 2 rondas (10
+                # min) a que le tocara su cadena. Vender no gasta cuota GMGN.
+                vendida = False
+                for ch_v in ("sol", "robinhood"):
+                    if vender_si_toca(ch_v):
+                        vendida = True
+                if vendida:
                     time.sleep(AUTO_CADA)
                     continue         # una operación por ronda
+
+                r = screen_once(chain) or {}
 
                 # ── PIRAMIDADO: ampliar lo que ya está funcionando va
                 # ANTES que abrir nada nuevo — es la señal más barata y
