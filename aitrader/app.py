@@ -73,7 +73,12 @@ CFG = {
     "max_buy_tax": 0.10,
     "max_sell_tax": 0.10,
     "max_rug_ratio": 0.60,
-    "max_bundler_ratio": 0.30,        # memecoin bundler 较常见，放宽
+    # ☠️ 0.30 era generoso: un 25-30% del supply comprado en el MISMO bloque
+    # que el lanzamiento es dinero coordinado que sale junto. Javi (01/09)
+    # preguntó justo por esto. Bajado a 0.20 tras medir el feed real: con
+    # 0.30 pasaban tokens de 25-29% de bundle que son rug esperando fecha.
+    "max_bundler_ratio": 0.20,
+    "max_top10": 0.60,                # top-10 holders: si mandan, te hunden
     "max_dev_holding_pct": 0.10,
     "max_top10_concentration": 0.40,
     # 选择质量：共识 = 聪明钱(smart_degen) + 知名KOL(renowned) 计数之和
@@ -2695,10 +2700,37 @@ def señal_smart_money(chain: str) -> dict | None:
         tmc = s.get("first_trigger_mc") or s.get("trigger_mc") or 0
         if tmc and mc < tmc * 0.7:
             continue
-        _COPY_VISTOS.add(addr)
+        # ☠️ EL COPYTRADING SE SALTABA TODOS LOS FILTROS DE SEGURIDAD.
+        # GPRO se compró el 01/09 por señal smart money teniendo **40% de
+        # bundlers** — el screener la había rechazado ("bundler 40% > 30%")
+        # pero esta ruta ni miraba. Que 678 wallets compren no impide que
+        # el token esté empaquetado para un rug: los bundlers compran en el
+        # mismo bloque que el dev y salen juntos.
+        # `market signal` YA trae estos campos: filtrar aquí no cuesta ni
+        # una llamada extra a GMGN.
         d = s.get("data") or {}
+        bundle = _f(d.get("bundler_rate"))
+        top10 = _f(d.get("top_10_holder_rate"))
+        rug = _f(d.get("rug_ratio"))
+        malo = None
+        if bundle > CFG["max_bundler_ratio"]:
+            malo = f"bundlers {bundle:.0%}"
+        elif top10 > CFG.get("max_top10", 0.60):
+            malo = f"top10 {top10:.0%}"
+        elif rug > 0.60:
+            malo = f"rug ratio {rug:.0%}"
+        elif d.get("is_honeypot"):
+            malo = "honeypot"
+        if malo:
+            _COPY_VISTOS.add(addr)      # no reevaluarla cada ronda
+            log("COPY_SKIP", d.get("symbol") or addr[:6],
+                f"señal smart money DESCARTADA: {malo}")
+            continue
+
+        _COPY_VISTOS.add(addr)
         return {"address": addr, "symbol": d.get("symbol") or addr[:6],
-                "veces": s.get("signal_times", 1)}
+                "veces": s.get("signal_times", 1),
+                "bundle": bundle, "top10": top10}
     return None
 
 
