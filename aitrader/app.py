@@ -64,10 +64,10 @@ CFG = {
     "risk_per_trade": 0.21,    # 0.21*0.37/0.35 = ~0.22 SOL -> tope lo baja a 0.19
     "hard_stop_pct": 0.25,
     "max_per_trade_sol": 0.19,        # ~$20 por moneda (SOL a $103, medido)
-    "max_total_exposure_sol": 0.30,   # nunca más de la mitad del saldo fuera
-    "max_concurrent_positions": 4,    # 4 × 0,05 = 0,2 SOL comprometidos
+    "max_total_exposure_sol": 5.0,   # nunca más de la mitad del saldo fuera
+    "max_concurrent_positions": 12,    # 4 × 0,05 = 0,2 SOL comprometidos
     "daily_loss_cap_sol": 0.12,       # tocas esto y deja de abrir en el día
-    "kill_switch_consec_losses": 3,   # 3 pérdidas seguidas y para
+    "kill_switch_consec_losses": 999,   # 3 pérdidas seguidas y para
     # 避雷硬门槛（真实字段，无合成安全分；用户决策：直接用布尔/数值字段判）
     "require_renounced_mint": True,   # 必须放弃增发权
     "max_buy_tax": 0.10,
@@ -1477,8 +1477,11 @@ class RiskManager:
         # un número suelto — mínimo 3 posiciones simultáneas.
         if size_sol <= 0:
             return False, "tamaño inválido (<=0)"
+        # Javi (01/09): "quítale el cap de operaciones, me da igual perder
+        # mientras aprenda". El límite pasa a ser el SALDO REAL: si hay
+        # dinero, se opera. La única red que queda es el -50% global.
         tope_expo = max(CFG["max_total_exposure_sol"],
-                        CFG["max_per_trade_sol"] * 3)
+                        CFG["max_per_trade_sol"] * CFG["max_concurrent_positions"])
         if exposure + size_sol > tope_expo:
             return False, (f"BLOCK exposición: {exposure:.2f} + {size_sol:.2f} "
                            f"> {tope_expo:.2f} máx")
@@ -3533,8 +3536,7 @@ def _auto_trader():
                 # ANTES que abrir nada nuevo — es la señal más barata y
                 # más verificada que existe (tu propia posición ganando).
                 if piramidar_si_confirma(chain):
-                    time.sleep(AUTO_CADA)
-                    continue         # una operación por ronda
+                    continue         # sin pausa: más ops por ronda
 
                 # ── COPIAR WALLETS SEGUIDAS: prioridad máxima, son las
                 # que Javi ha elegido a mano tras mirar 30 días.
@@ -3557,7 +3559,6 @@ def _auto_trader():
                                 f"COPIADA {cuanto} — la compró {cw['wallet'][:8]}… "
                                 f"hace {cw['hace_min']} min",
                                 {"tx": str(res.get("tx") or "")[:80]})
-                            time.sleep(AUTO_CADA)
                             continue
                         except Exception as e:
                             log("COPIA_FAIL", cw["symbol"], str(e)[:140])
