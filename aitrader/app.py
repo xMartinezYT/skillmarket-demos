@@ -1434,8 +1434,17 @@ class RiskManager:
             return False, "BLOCK 当日亏损上限"
         if n_positions >= CFG["max_concurrent_positions"]:
             return False, f"BLOCK 已达最大并发持仓 ({CFG['max_concurrent_positions']})"
-        if exposure + size_sol > CFG["max_total_exposure_sol"]:
-            return False, "BLOCK 超出总敞口上限"
+        # ☠️ EL TOPE FIJO (0,30) ERA DE CUANDO LAS POSICIONES ERAN 0,05.
+        # Con posiciones de 0,19 (interés compuesto), UNA sola ya dejaba
+        # 0,11 libres y toda compra siguiente moría con "超出总敞口上限":
+        # `max_concurrent_positions=4` no se alcanzaba NUNCA. El tope de
+        # exposición tiene que escalar con el tamaño de posición, no ser
+        # un número suelto — mínimo 3 posiciones simultáneas.
+        tope_expo = max(CFG["max_total_exposure_sol"],
+                        CFG["max_per_trade_sol"] * 3)
+        if exposure + size_sol > tope_expo:
+            return False, (f"BLOCK exposición: {exposure:.2f} + {size_sol:.2f} "
+                           f"> {tope_expo:.2f} máx")
         return True, "ok"
 
 EQUITY_FILE = OUT_DIR / "equity_inicial.json"
@@ -2502,7 +2511,31 @@ def sincronizar_posiciones() -> int:
     return fuera
 
 
-_PICOS: dict = {}          # address -> pnl maximo visto (para el trailing local)
+PICOS_FILE = OUT_DIR / "picos.json"
+
+
+def _cargar_picos() -> dict:
+    """El pico de cada posición SOBREVIVE a reinicios.
+
+    ☠️ Vivía solo en memoria: al reiniciar el servicio (hoy lo he hecho 15
+    veces) el bot olvidaba el máximo tocado y recalculaba el trailing desde
+    el pnl del momento — o sea, la regla "vende si devuelve 25 puntos desde
+    el pico" NO se cumplía siempre, que es justo lo que Javi preguntó.
+    """
+    try:
+        return json.loads(PICOS_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def _guardar_picos() -> None:
+    try:
+        PICOS_FILE.write_text(json.dumps(_PICOS))
+    except Exception:
+        pass
+
+
+_PICOS: dict = _cargar_picos()   # address -> pnl maximo visto (trailing local)
 
 
 def vender_si_toca(chain: str) -> bool:
@@ -2534,8 +2567,11 @@ def vender_si_toca(chain: str) -> bool:
         if not cur:
             continue
         pnl = cur / ep - 1
-        pico = max(_PICOS.get(addr, 0.0), pnl)
-        _PICOS[addr] = pico
+        pico_previo = _PICOS.get(addr, 0.0)
+        pico = max(pico_previo, pnl)
+        if pico > pico_previo:
+            _PICOS[addr] = pico
+            _guardar_picos()
 
         motivo = None
         if pico > 0.15 and (pico - pnl) > 0.25:
@@ -2557,6 +2593,7 @@ def vender_si_toca(chain: str) -> bool:
         try:
             do_sell(addr)
             _PICOS.pop(addr, None)
+            _guardar_picos()
             log("VENTA_PROPIA", pos.get("symbol"),
                 f"VENDIDA a {pnl*100:+.0f}% — {motivo}")
             return True
