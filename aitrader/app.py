@@ -2649,6 +2649,43 @@ def señal_smart_money(chain: str) -> dict | None:
     return None
 
 
+def porque_compra(dec: dict) -> str:
+    """El PORQUÉ de una compra, en una frase que Javi pueda leer.
+
+    Javi (01/09): "donde pone detalle, que diga el porqué". `COMPRADA 0.19
+    (sol)` dice el QUÉ; esto saca de features/verdict los 2-3 datos que de
+    verdad inclinaron la decisión, por orden de fuerza.
+    """
+    f = dec.get("features") or {}
+    v = dec.get("verdict") or {}
+    partes = []
+    sm = f.get("sm_confluence") or 0
+    if sm:
+        partes.append(f"{sm} smart money dentro")
+    chg5 = (f.get("chg_5m") or 0) * 100
+    if chg5 >= 10:
+        partes.append(f"subiendo {chg5:+.0f}% en 5m")
+    br = f.get("buy_ratio") or 0
+    if br >= 1.5:
+        partes.append(f"presión compradora {br:.1f}x")
+    liq = f.get("liquidity") or 0
+    mcap = f.get("mcap") or 0
+    if liq and mcap and liq / mcap > 0.25:
+        partes.append(f"liquidez sana ({liq/mcap*100:.0f}% del cap)")
+    ds = f.get("dev_score")
+    if ds is not None and ds >= 60:
+        partes.append(f"dev con historial {ds:.0f}/100")
+    edad = f.get("age_min") or 0
+    if 0 < edad < 60:
+        partes.append(f"{edad:.0f} min de vida")
+    conv = v.get("conviction")
+    if conv:
+        partes.append(f"convicción {conv}")
+    if not partes:
+        partes.append(f"prio {dec.get('priority', '?')} — pasó todos los filtros")
+    return " · ".join(partes[:4])
+
+
 def tamano_auto(chain: str) -> float:
     """Importe adaptado al saldo REAL de la cadena QUE SE VA A OPERAR.
 
@@ -2802,7 +2839,8 @@ def _auto_trader():
                         # Pasarle `res` crudo tumbó la compra de BUCKET el
                         # 31/08 — la orden salió pero el registro falló.
                         log("AUTO", str(dec.get("symbol")),
-                            f"COMPRADA {dec['size_sol']} ({chain})",
+                            f"COMPRADA {dec['size_sol']} ({chain}) — "
+                            f"{porque_compra(dec)}",
                             {"tx": str(res.get("tx") or res.get("hash") or "")[:80]})
                     except Exception as e:
                         log("AUTO_FAIL", dec.get("symbol"), str(e)[:160])
