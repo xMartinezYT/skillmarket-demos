@@ -2298,21 +2298,50 @@ def api_resumen():
         "auto_cada": AUTO_CADA,
     }
 
+_DEX_CACHE: dict = {}     # mint -> (ts, precio_usd) via DexScreener
+
+
+def _precio_dexscreener(mint: str) -> float | None:
+    """Precio actual SIN gastar cuota de GMGN.
+
+    ☠️ El pnl no se actualizaba: `monitor_positions` depende de gmgn-cli
+    (12s de freno + bans) y casi siempre fallaba, dejando el pnl congelado
+    en 0. DexScreener es gratis, sin API key, y sus unidades cuadran con el
+    entry_price de GMGN (verificado: USA entry 1.12e-05 vs dex 2.89e-05 =
+    el +155% real del cierre). Caché 30s por token.
+    """
+    hit = _DEX_CACHE.get(mint)
+    if hit and time.time() - hit[0] < 30:
+        return hit[1]
+    try:
+        req = urlreq.Request(
+            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+            headers={"User-Agent": "Mozilla/5.0"})
+        d = json.loads(urlreq.urlopen(req, timeout=8).read())
+        pares = d.get("pairs") or []
+        precio = float(pares[0]["priceUsd"]) if pares else None
+    except Exception:
+        precio = None
+    if precio:
+        _DEX_CACHE[mint] = (time.time(), precio)
+    return precio
+
+
 @app.get("/api/positions_light")
 def api_positions_light():
-    """Posiciones SIN tocar gmgn-cli — para la UI.
-
-    ☠️ /api/positions llama a `monitor_positions()`, que consulta precio y
-    seguridad de CADA posición vía gmgn-cli (12s de freno por llamada, más
-    esperas de ban) CON el lock global cogido: medido >150s de respuesta, y
-    mientras tanto bloquea /api/mode y las compras. La pantalla no necesita
-    eso: pinta el último pnl conocido (lo refresca el auto-trader) y listo.
-    """
-    return dict(positions=[
-        dict(symbol=p.get("symbol"), address=p.get("address"),
-             size_sol=p.get("size_sol"), pnl=p.get("pnl", 0),
-             chain=p.get("chain", "sol"))
-        for p in ST.positions])
+    """Posiciones para la UI: rápidas Y con pnl vivo (DexScreener, no GMGN)."""
+    out = []
+    for p in ST.positions:
+        pnl = p.get("pnl", 0)
+        ep = p.get("entry_price") or 0
+        cur = _precio_dexscreener(p.get("address", "")) if ep else None
+        if cur and ep:
+            pnl = round(cur / ep - 1, 4)
+            p["pnl"] = pnl            # de paso lo persistimos en memoria
+        out.append(dict(symbol=p.get("symbol"), address=p.get("address"),
+                        size_sol=p.get("size_sol"), pnl=pnl,
+                        chain=p.get("chain", "sol")))
+    return dict(positions=out)
 
 
 @app.get("/api/positions")
