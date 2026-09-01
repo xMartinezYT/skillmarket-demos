@@ -1698,8 +1698,16 @@ def log(action: str, symbol: str, reason: str, extra: dict | None = None):
     # log eran las 17:32 suyas, así que parecía que el bot llevaba 3 HORAS
     # parado cuando llevaba 6 minutos. Hora local siempre — quien lee el
     # feed vive en una zona, no en UTC.
+    # ☠️ `**extra` con una clave repetida (symbol, action, reason...) lanza
+    # "dict() got multiple values" y TUMBA LA COMPRA ENTERA: 4 operaciones
+    # perdidas el 01/09 por esto. Las claves propias mandan; lo que venga
+    # repetido en `extra` se guarda con prefijo en vez de reventar.
+    base = {"ts", "action", "symbol", "reason", "mode"}
+    limpio = {}
+    for k, v in (extra or {}).items():
+        limpio[f"extra_{k}" if k in base else k] = v
     rec = dict(ts=datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-               action=action, symbol=symbol, reason=reason, mode=ST.mode, **(extra or {}))
+               action=action, symbol=symbol, reason=reason, mode=ST.mode, **limpio)
     with LOG_PATH.open("a") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -2685,6 +2693,13 @@ def vender_si_toca(chain: str) -> bool:
             continue
         # MISMO número que ve Javi en pantalla: los dos leen del store.
         cur = PRECIOS.get(addr)
+        if not cur:
+            # posición recién abierta: pedir precio ahora, no dar por ciega
+            precio, fuente = PRECIOS._pedir(addr, chain)
+            if precio:
+                with PRECIOS._lock:
+                    PRECIOS._d[addr] = (time.time(), precio, fuente)
+                cur = precio
         edad = PRECIOS.edad(addr)
         if cur and edad is not None and edad > 120:
             # Precio viejo: no se decide con datos rancios, pero SE AVISA.
@@ -3402,6 +3417,9 @@ class _PriceStore:
             if precio:
                 with self._lock:
                     self._d[addr] = (time.time(), precio, fuente)
+            # si falla, se CONSERVA el valor anterior (con su edad): un
+            # precio de hace 30s es infinitamente mejor que ninguno, y la
+            # edad ya avisa al guardián si se queda rancio.
         # soltar lo que ya no se tiene
         vivos = {a for a, _ in objetivos}
         with self._lock:
