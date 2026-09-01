@@ -2423,9 +2423,40 @@ def sincronizar_posiciones() -> int:
         except Exception:
             return 0            # sin lectura fiable, no se toca nada
 
+    # ── Robinhood (EVM): balanceOf por contrato. ☠️ Sin esto, LOOT quedó
+    # de fantasma bloqueando exposición: el limpiador solo miraba Solana y
+    # las posiciones EVM no se verificaban NUNCA contra la cadena.
+    W_EVM = "adb46310e6d33a2dd550e7bb1adf21aee0788086"
+    vivos_rh = set()
+    rh_ok = True
+    for pos in ST.positions:
+        if pos.get("chain") != "robinhood":
+            continue
+        try:
+            data = "0x70a08231" + "0" * 24 + W_EVM
+            cuerpo = {"jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                      "params": [{"to": pos.get("address"), "data": data},
+                                 "latest"]}
+            req = urlreq.Request("https://robinhood-rpc.publicnode.com",
+                                 data=json.dumps(cuerpo).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "Mozilla/5.0"})
+            r = json.loads(urlreq.urlopen(req, timeout=12).read()).get("result", "0x0")
+            if int(r, 16) > 0:
+                vivos_rh.add(pos.get("address"))
+        except Exception:
+            rh_ok = False          # sin lectura fiable: no borrar EVM esta ronda
+            break
+
     antes = len(ST.positions)
-    ST.positions = [p for p in ST.positions
-                    if p.get("chain") != "sol" or p.get("address") in vivos]
+    def _viva(p):
+        ch = p.get("chain", "sol")
+        if ch == "sol":
+            return p.get("address") in vivos
+        if ch == "robinhood":
+            return (not rh_ok) or p.get("address") in vivos_rh
+        return True                 # cadena desconocida: no tocar
+    ST.positions = [p for p in ST.positions if _viva(p)]
     fuera = antes - len(ST.positions)
     if fuera:
         try:
