@@ -1,127 +1,223 @@
-"""Qué señales funcionan de verdad, leyendo lo que YA pasó.
+#!/usr/bin/env python3
+"""aprender.py — el bot estudia sus propias operaciones CERRADAS y propone
+ajustes de umbrales CON DATOS, no con opiniones.
 
-Javi (31/08): *"pon cantidades más bajas pero con tasas de aprendizaje"*.
+Javi (01/09): *"le metemos que tome mejores decisiones"* — pero sin LLM por
+operación (lento y caro para monedas que viven minutos). Esto es lo contrario:
+después de operar, mirar QUÉ funcionó y ajustar los números del filtro.
 
-La única forma honesta de "aprender" aquí es mirar el registro real de
-decisiones y resultados (`outputs/trade_decisions.jsonl`, que el panel escribe
-solo) y responder: **¿qué característica tenían las que ganaron?**
-
-Nada de opinar. Si no hay operaciones cerradas suficientes, lo dice y no
-inventa un patrón — con 3 operaciones no se aprende nada, se hace ruido.
+Fuentes (ninguna gasta cuota de GMGN):
+  1. La CADENA (RPC de Solana/Robinhood): las entradas y salidas reales con
+     sus importes. La verdad contable. Los logs mienten; la cadena no.
+  2. `trade_decisions.jsonl`: con qué prioridad/motivo/fuente (screener o
+     copytrading) se compró cada cosa. El contexto de cada decisión.
 
 Uso:
-    python3 aprender.py
+    venv/bin/python3 aprender.py            # informe en pantalla
+    venv/bin/python3 aprender.py --json     # para consumir desde la UI
+
+Regla de oro: por debajo de 8 operaciones cerradas NO propone cambios — con
+3 trades cualquier conclusión es ruido con corbata.
 """
 from __future__ import annotations
 
 import json
 import pathlib
-import statistics as st
+import sys
+import time
+import urllib.request
 
-REG = pathlib.Path.home() / "gmgn-demos" / "aitrader" / "outputs" / "trade_decisions.jsonl"
-# Por debajo de esto no hay nada que aprender: son anécdotas, no datos.
-MINIMO = 8
+HERE = pathlib.Path(__file__).parent
+LOG = HERE / "outputs" / "trade_decisions.jsonl"
+SALIDA = HERE / "outputs" / "aprendizajes.json"
+
+WALLET_SOL = "9RUa5ci9uA7od89YSW82TLw6QgmxePTfqxZPCiTY5kwH"
+RPC_SOL = "https://api.mainnet-beta.solana.com"
+
+MIN_CERRADAS = 8          # por debajo de esto, silencio
 
 
-def leer() -> list[dict]:
-    if not REG.exists():
-        return []
-    out = []
-    for linea in REG.read_text(errors="ignore").splitlines():
-        linea = linea.strip()
-        if not linea:
-            continue
+def _rpc(method: str, params: list) -> dict:
+    req = urllib.request.Request(
+        RPC_SOL,
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
+                         "params": params}).encode(),
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0"})
+    return json.loads(urllib.request.urlopen(req, timeout=30).read())
+
+
+def operaciones_cerradas() -> list[dict]:
+    """Reconstruye cada ciclo compra→venta(s) desde la CADENA.
+
+    Agrupa por token: los SOL que salieron al comprar y los que volvieron al
+    vender. Un token con compras y ventas y sin saldo restante = cerrado.
+    """
+    firmas = _rpc("getSignaturesForAddress",
+                  [WALLET_SOL, {"limit": 200}])["result"]
+    por_token: dict[str, dict] = {}
+    for s in firmas:
         try:
-            out.append(json.loads(linea))
-        except Exception:
-            pass
-    return out
-
-
-def cerradas(filas: list[dict]) -> list[dict]:
-    """Operaciones con resultado: una compra y su venta."""
-    compras: dict[str, dict] = {}
-    fuera = []
-    for f in filas:
-        d = f.get("decision") or f
-        acc = (d.get("action") or f.get("event") or "").upper()
-        addr = d.get("address") or f.get("address")
-        if not addr:
-            continue
-        if acc in ("BUY", "COMPRA"):
-            compras[addr] = d
-        elif acc in ("SELL", "VENTA") and addr in compras:
-            c = compras.pop(addr)
-            try:
-                pnl = float(d.get("pnl_pct") or d.get("pnl") or 0)
-            except (TypeError, ValueError):
-                pnl = 0.0
-            fuera.append({"symbol": c.get("symbol", "?"), "pnl": pnl,
-                          "entrada": c, "salida": d})
-    return fuera
-
-
-def resumen() -> None:
-    filas = leer()
-    print(f"registro: {len(filas)} eventos\n")
-    if not filas:
-        print("Todavía no hay nada. El panel escribe aquí en cuanto")
-        print("empiece a filtrar y a operar.")
-        return
-
-    # Qué está rechazando y por qué: útil desde el primer día, sin necesidad
-    # de haber operado.
-    motivos: dict[str, int] = {}
-    for f in filas:
-        d = f.get("decision") or f
-        if (d.get("action") or "").upper() == "SKIP":
-            r = (d.get("reason") or "?").split("：")[0].split(":")[0][:44]
-            motivos[r] = motivos.get(r, 0) + 1
-    if motivos:
-        print("POR QUÉ ESTÁ DESCARTANDO MONEDAS:")
-        for r, n in sorted(motivos.items(), key=lambda x: -x[1])[:8]:
-            print(f"  {n:4}x  {r}")
-        print()
-
-    ops = cerradas(filas)
-    if len(ops) < MINIMO:
-        print(f"OPERACIONES CERRADAS: {len(ops)}")
-        print(f"Hacen falta al menos {MINIMO} para decir algo con sentido.")
-        print("Con menos, cualquier patrón que encuentre es casualidad.")
-        return
-
-    pnls = [o["pnl"] for o in ops]
-    ganan = [p for p in pnls if p > 0]
-    print(f"OPERACIONES CERRADAS: {len(ops)}")
-    print(f"  aciertos: {len(ganan)}/{len(ops)} ({len(ganan)/len(ops)*100:.0f}%)")
-    print(f"  mediana: {st.median(pnls):+.1f}%   media: {sum(pnls)/len(pnls):+.1f}%")
-    print(f"  mejor: {max(pnls):+.1f}%   peor: {min(pnls):+.1f}%")
-
-    # ¿Qué distingue a las ganadoras? Se comparan los campos numéricos de la
-    # entrada entre ganadoras y perdedoras. Solo se reporta lo que separa de
-    # verdad; una diferencia del 10% es ruido.
-    buenas = [o["entrada"] for o in ops if o["pnl"] > 0]
-    malas = [o["entrada"] for o in ops if o["pnl"] <= 0]
-    if buenas and malas:
-        print("\nQUÉ TENÍAN LAS QUE GANARON:")
-        campos = set()
-        for e in buenas + malas:
-            campos |= {k for k, v in e.items() if isinstance(v, (int, float))}
-        algo = False
-        for c in sorted(campos):
-            b = [float(e[c]) for e in buenas if isinstance(e.get(c), (int, float))]
-            m = [float(e[c]) for e in malas if isinstance(e.get(c), (int, float))]
-            if len(b) < 3 or len(m) < 3:
+            tx = _rpc("getTransaction",
+                      [s["signature"], {"encoding": "jsonParsed",
+                                        "maxSupportedTransactionVersion": 0}])
+            meta = (tx.get("result") or {}).get("meta") or {}
+            if not meta or meta.get("err"):
                 continue
-            mb, mm = st.median(b), st.median(m)
-            if mm and abs(mb - mm) / max(abs(mm), 1e-9) > 0.5:
-                algo = True
-                print(f"  {c:26} ganadoras {mb:>12,.2f}   perdedoras {mm:>12,.2f}")
-        if not algo:
-            print("  Ninguna característica separa a las ganadoras de las")
-            print("  perdedoras. Eso también es un resultado: de momento no")
-            print("  hay patrón, y forzar uno sería inventárselo.")
+            dif = (meta.get("postBalances", [0])[0]
+                   - meta.get("preBalances", [0])[0]) / 1e9
+            mint = ""
+            for b in (meta.get("postTokenBalances") or []):
+                m = b.get("mint", "")
+                # USDC/WSOL no son operaciones del bot
+                if m and not m.startswith("So1111") and not m.startswith("EPjFW"):
+                    mint = m
+                    break
+            if not mint or abs(dif) < 0.001:
+                continue
+            t = por_token.setdefault(
+                mint, {"gastado": 0.0, "recuperado": 0.0,
+                       "t_entrada": None, "t_salida": None})
+            bt = s.get("blockTime") or 0
+            if dif < 0:
+                t["gastado"] += -dif
+                t["t_entrada"] = min(t["t_entrada"] or bt, bt)
+            else:
+                t["recuperado"] += dif
+                t["t_salida"] = max(t["t_salida"] or bt, bt)
+        except Exception:
+            continue
+
+    cerradas = []
+    for mint, t in por_token.items():
+        if t["gastado"] > 0 and t["recuperado"] > 0:
+            pnl = t["recuperado"] / t["gastado"] - 1
+            dur = ((t["t_salida"] or 0) - (t["t_entrada"] or 0)) / 60
+            cerradas.append({"mint": mint, "gastado": round(t["gastado"], 5),
+                             "recuperado": round(t["recuperado"], 5),
+                             "pnl": round(pnl, 4),
+                             "minutos_dentro": round(max(dur, 0), 1),
+                             "t_entrada": t["t_entrada"]})
+    cerradas.sort(key=lambda x: x["t_entrada"] or 0)
+    return cerradas
+
+
+def contexto_compras() -> dict[str, dict]:
+    """symbol/prioridad/fuente de cada compra, del log de decisiones."""
+    ctx: dict[str, dict] = {}
+    if not LOG.exists():
+        return ctx
+    for l in LOG.read_text().splitlines():
+        try:
+            d = json.loads(l)
+        except Exception:
+            continue
+        if d.get("action") in ("BUY", "AUTO", "COPY") and d.get("symbol"):
+            ctx[str(d.get("symbol"))] = {
+                "fuente": "copytrading" if d["action"] == "COPY" else "screener",
+                "ts": d.get("ts")}
+    return ctx
+
+
+def analizar(cerradas: list[dict]) -> dict:
+    n = len(cerradas)
+    ganadoras = [c for c in cerradas if c["pnl"] > 0]
+    perdedoras = [c for c in cerradas if c["pnl"] <= 0]
+    total_in = sum(c["gastado"] for c in cerradas)
+    total_out = sum(c["recuperado"] for c in cerradas)
+
+    res: dict = {
+        "generado": time.strftime("%Y-%m-%d %H:%M"),
+        "cerradas": n,
+        "ganadoras": len(ganadoras),
+        "winrate": round(len(ganadoras) / n * 100, 1) if n else 0,
+        "pnl_medio_pct": round(sum(c["pnl"] for c in cerradas) / n * 100, 1) if n else 0,
+        "neto_sol": round(total_out - total_in, 5),
+        "neto_pct": round((total_out / total_in - 1) * 100, 1) if total_in else 0,
+        "mediana_minutos": sorted(c["minutos_dentro"] for c in cerradas)[n // 2] if n else 0,
+        "operaciones": cerradas,
+        "propuestas": [],
+    }
+    if n < MIN_CERRADAS:
+        res["veredicto"] = (f"Solo {n} operaciones cerradas — con menos de "
+                            f"{MIN_CERRADAS} cualquier ajuste es ruido. Sigo mirando.")
+        return res
+
+    # ── propuestas SOLO si el patrón es claro ──────────────────────────
+    p = res["propuestas"]
+
+    # 1. ¿Las salidas rápidas pierden? (el patrón que ya olimos a ojo)
+    rapidas = [c for c in cerradas if c["minutos_dentro"] < 5]
+    lentas = [c for c in cerradas if c["minutos_dentro"] >= 5]
+    if len(rapidas) >= 4 and rapidas and lentas:
+        pnl_r = sum(c["pnl"] for c in rapidas) / len(rapidas)
+        pnl_l = sum(c["pnl"] for c in lentas) / len(lentas)
+        if pnl_r < pnl_l - 0.05:
+            p.append({
+                "que": "Las salidas de <5 min rinden peor",
+                "dato": f"salida rápida {pnl_r*100:+.0f}% vs lenta {pnl_l*100:+.0f}% "
+                        f"({len(rapidas)} vs {len(lentas)} ops)",
+                "ajuste": "subir el primer take-profit (las ventas tempranas "
+                          "cortan justo antes del recorrido)"})
+
+    # 2. ¿El stop-loss del -40% se come casi todo lo perdido?
+    fuertes = [c for c in perdedoras if c["pnl"] < -0.3]
+    if perdedoras and len(fuertes) / len(perdedoras) > 0.6:
+        p.append({
+            "que": "La mayoría de pérdidas llegan al stop entero (-30%+)",
+            "dato": f"{len(fuertes)} de {len(perdedoras)} pérdidas son > -30%",
+            "ajuste": "stop-loss más ceñido (-40% → -25%): cuando falla, "
+                      "falla del todo; cortar antes ahorra la diferencia"})
+
+    # 3. ¿Pocas ganadoras pero grandes? → el problema es la selección
+    if res["winrate"] < 35 and ganadoras:
+        mejor = max(c["pnl"] for c in ganadoras)
+        p.append({
+            "que": f"Winrate bajo ({res['winrate']}%)",
+            "dato": f"la mejor hizo {mejor*100:+.0f}% — hay señal, sobra ruido",
+            "ajuste": "subir listón de entrada (menos trades, mejores): "
+                      "menos operaciones también es menos comisión"})
+
+    # 4. ¿Comisiones se comen el resultado? (entrada+salida ≈ 2.5-3%)
+    if n >= 8 and -0.05 < res["pnl_medio_pct"] / 100 < 0.05:
+        p.append({
+            "que": "PnL medio ≈ 0: las comisiones deciden el signo",
+            "dato": f"pnl medio {res['pnl_medio_pct']:+.1f}% vs ~3% de coste por ciclo",
+            "ajuste": "posiciones más grandes y menos frecuentes — el coste "
+                      "fijo pesa menos y cada acierto cuenta más"})
+
+    res["veredicto"] = (f"{n} cerradas · winrate {res['winrate']}% · "
+                        f"neto {res['neto_pct']:+.1f}% · "
+                        f"{len(p)} propuesta(s) con datos")
+    return res
+
+
+def main() -> int:
+    como_json = "--json" in sys.argv
+    cerradas = operaciones_cerradas()
+    res = analizar(cerradas)
+    SALIDA.write_text(json.dumps(res, ensure_ascii=False, indent=1))
+
+    if como_json:
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
+
+    print(f"\n═══ APRENDER · {res['generado']} ═══\n")
+    print(f"  cerradas:  {res['cerradas']}  (ganadoras {res['ganadoras']})")
+    print(f"  winrate:   {res['winrate']}%")
+    print(f"  pnl medio: {res['pnl_medio_pct']:+.1f}%")
+    print(f"  neto:      {res['neto_sol']:+.5f} SOL ({res['neto_pct']:+.1f}%)")
+    print(f"  mediana en posición: {res['mediana_minutos']:.0f} min\n")
+    for c in res["operaciones"][-10:]:
+        print(f"    {c['mint'][:10]}…  {c['pnl']*100:+6.1f}%  "
+              f"({c['minutos_dentro']:.0f} min)")
+    print(f"\n  {res['veredicto']}\n")
+    for i, pr in enumerate(res["propuestas"], 1):
+        print(f"  {i}. {pr['que']}")
+        print(f"     dato:   {pr['dato']}")
+        print(f"     ajuste: {pr['ajuste']}\n")
+    return 0
 
 
 if __name__ == "__main__":
-    resumen()
+    sys.exit(main())
