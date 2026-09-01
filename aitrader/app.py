@@ -2717,14 +2717,19 @@ def tamano_auto(chain: str) -> float:
         saldo = (r["value"] / 1e9) if isinstance(r, dict) else int(r, 16) / 1e18
     except Exception:
         return tope                    # sin lectura: se intenta el tope
+    # ── INTERÉS COMPUESTO (Javi, 01/09: "ganar más de forma progresiva").
+    # El tope fijo ($20) no compone: ganar no cambiaba la siguiente apuesta.
+    # Ahora la posición es el 20% DEL SALDO de la cadena: si la cuenta
+    # crece, las posiciones crecen solas; si encoge, se achican solas —
+    # compone hacia arriba Y frena hacia abajo, sin tocar nada a mano.
+    # Suelo: el tope fijo de siempre, para que una racha mala no deje las
+    # posiciones tan pequeñas que las comisiones (~3%/ciclo) se lo coman.
     if chain == "sol":
         disponible = saldo - 0.02      # colchón fees/rent en SOL
-        tope_chain = tope
+        tope_chain = max(tope, round(saldo * 0.20, 5))
     else:
-        # En Robinhood el importe va en ETH: mismo valor en dólares que el
-        # tope de sol (0.19 SOL ≈ $20 ≈ 0.008 ETH), colchón de gas menor.
         disponible = saldo - 0.002
-        tope_chain = 0.008
+        tope_chain = max(0.008, round(saldo * 0.20, 5))
     if disponible < tope_chain * 0.5:
         return 0.0                     # ni media posición: no operar
     return round(min(tope_chain, disponible), 5)
