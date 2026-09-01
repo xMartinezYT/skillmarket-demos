@@ -130,7 +130,7 @@ async function jpost(u, b) {
 /* ── cabecera: modo + kpis ── */
 async function pintaEstado() {
   /* /api/status NO trae posiciones (verificado): van en /api/positions. */
-  const [s, ps] = await Promise.all([jget("/api/status"), jget("/api/positions")]);
+  const [s, ps] = await Promise.all([jget("/api/status"), jget("/api/positions_light")]);
   const pos = ps.positions || [];
   $("bShadow").classList.toggle("on", s.mode === "SHADOW");
   $("bLive").classList.toggle("on", s.mode === "LIVE");

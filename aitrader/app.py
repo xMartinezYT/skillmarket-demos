@@ -1656,6 +1656,9 @@ def log(action: str, symbol: str, reason: str, extra: dict | None = None):
 # ──────────────────────────────────────────────────────────────────────────
 # 11. 筛选流水线（核心：确定性先筛 → 评分 → LLM 只判幸存者 → 产候选，不执行）
 # ──────────────────────────────────────────────────────────────────────────
+_SCREEN_CACHE: dict = {}      # chain -> (ts, resultado) del ultimo escaneo completo
+
+
 def screen_once(chain: str) -> dict:
     g = ST.adapter_for(chain)
     fx = FeatureExtractor(g)
@@ -1731,7 +1734,9 @@ def screen_once(chain: str) -> dict:
     positions_out = monitor_positions(chain, rows_by_addr)
 
     # 回传后端真实 mode：前端据此同步 LIVE/SHADOW 开关，避免重启后端后开关停留在 LIVE 误导
-    return dict(decisions=decisions, portfolio=_portfolio(), positions=positions_out, mode=ST.mode)
+    _res = dict(decisions=decisions, portfolio=_portfolio(), positions=positions_out, mode=ST.mode)
+    _SCREEN_CACHE[chain] = (time.time(), _res)
+    return _res
 
 # 公开演示缓存：后台线程定时刷新真实筛选结果，访客只读这份缓存（见 PUBLIC_DEMO 注释）。
 _PUBLIC_CACHE: dict = {"data": None, "err": None}
@@ -2137,6 +2142,14 @@ def api_run(r: RunIn):
             return JSONResponse(dict(decisions=[], portfolio=None, positions=[]))
         return JSONResponse(data)
     ch = valid_chain(r.chain)
+    # ☠️ EL LOCK ERA EL CUELGUE. El auto-trader escanea en fondo tardando
+    # minutos (12s de freno x ~15 llamadas) CON ST.lock; /api/run esperaba
+    # ese mismo lock y la UI se quedaba colgada >150s. La pantalla se sirve
+    # de la cache del ultimo escaneo completo (el auto-trader la refresca
+    # cada ronda); solo se escanea en linea si no hay cache o esta rancia.
+    hit = _SCREEN_CACHE.get(ch)
+    if hit and time.time() - hit[0] < AUTO_CADA * 2 + 120:
+        return JSONResponse(hit[1])
     with ST.lock:
         try:
             return JSONResponse(screen_once(ch))
@@ -2284,6 +2297,23 @@ def api_resumen():
         "copytrade": COPYTRADE,
         "auto_cada": AUTO_CADA,
     }
+
+@app.get("/api/positions_light")
+def api_positions_light():
+    """Posiciones SIN tocar gmgn-cli — para la UI.
+
+    ☠️ /api/positions llama a `monitor_positions()`, que consulta precio y
+    seguridad de CADA posición vía gmgn-cli (12s de freno por llamada, más
+    esperas de ban) CON el lock global cogido: medido >150s de respuesta, y
+    mientras tanto bloquea /api/mode y las compras. La pantalla no necesita
+    eso: pinta el último pnl conocido (lo refresca el auto-trader) y listo.
+    """
+    return dict(positions=[
+        dict(symbol=p.get("symbol"), address=p.get("address"),
+             size_sol=p.get("size_sol"), pnl=p.get("pnl", 0),
+             chain=p.get("chain", "sol"))
+        for p in ST.positions])
+
 
 @app.get("/api/positions")
 def api_positions(chain: str = "sol"):
