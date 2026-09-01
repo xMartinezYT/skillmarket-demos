@@ -2313,7 +2313,11 @@ def _precio_dexscreener(mint: str) -> float | None:
     el +155% real del cierre). Caché 30s por token.
     """
     hit = _DEX_CACHE.get(mint)
-    if hit and time.time() - hit[0] < 30:
+    # 10s, no 30: con monedas que hacen ±40% en 5 min, 30s de caché + 15s de
+    # refresco de la UI daban hasta 45s de desfase — "el PNL va desactualizado"
+    # (Javi, 01/09). DexScreener aguanta ~300 req/min; con <6 posiciones y
+    # 10s de caché ni nos acercamos.
+    if hit and time.time() - hit[0] < 10:
         return hit[1]
     try:
         req = urlreq.Request(

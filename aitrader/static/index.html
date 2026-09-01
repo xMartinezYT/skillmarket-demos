@@ -306,7 +306,7 @@ function refrescaRapido() {
 }
 setInterval(tick, 1000); tick();
 refrescaTodo();
-setInterval(refrescaRapido, 15000);
+setInterval(refrescaRapido, 10000);
 setInterval(() => { pintaResumen(); pintaScanner();
   ultimaAct = new Date().toTimeString().slice(0, 8); }, 60000);
 document.addEventListener("visibilitychange", () => {
