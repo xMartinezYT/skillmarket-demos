@@ -196,6 +196,7 @@ async function pintaOps() {
           : (o.action === "BUY" || o.action === "AUTO" || o.action === "PIRAMIDE") ? "buy"
           : (o.action === "VENTA_PROPIA" || o.action === "VENTA_EXTERNA" || o.action === "SELL") ? "copy"
           : o.action.includes("FAIL") ? "fail" : "";
+        // SISTEMA no lleva color: es info, no una operación
         const nombre = o.action === "COPY" ? "COPY"
           : (o.action === "BUY" || o.action === "AUTO") ? "COMPRA"
           : o.action === "SELL" ? "VENTA"
@@ -204,7 +205,8 @@ async function pintaOps() {
           : o.action === "PIRAMIDE" ? "AMPLIA"
           : o.action.includes("SKIP") ? "PASA"
           : o.action.includes("FAIL") ? "FALLO"
-          : o.action === "SYNC" ? "LIMPIEZA" : o.action;
+          : o.action === "SYNC" ? "LIMPIEZA"
+          : o.action === "SISTEMA" ? "SISTEMA" : o.action;
         return `<tr>
           <td class="gris">${hora(o.ts)}</td>
           <td><span class="chip ${cls}">${nombre}</span></td>

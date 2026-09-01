@@ -1429,11 +1429,11 @@ class RiskManager:
                            f"parada total, no se abre nada más")
         if self.consec_losses >= CFG["kill_switch_consec_losses"]:
             self.halted = True
-            return False, "BLOCK kill-switch（连亏）"
+            return False, "kill-switch: demasiadas pérdidas seguidas"
         if self.realized_loss_today >= CFG["daily_loss_cap_sol"]:
-            return False, "BLOCK 当日亏损上限"
+            return False, "tope de pérdida diaria alcanzado"
         if n_positions >= CFG["max_concurrent_positions"]:
-            return False, f"BLOCK 已达最大并发持仓 ({CFG['max_concurrent_positions']})"
+            return False, f"tope de {CFG['max_concurrent_positions']} posiciones a la vez"
         # ☠️ EL TOPE FIJO (0,30) ERA DE CUANDO LAS POSICIONES ERAN 0,05.
         # Con posiciones de 0,19 (interés compuesto), UNA sola ya dejaba
         # 0,11 libres y toda compra siguiente moría con "超出总敞口上限":
@@ -2281,7 +2281,7 @@ def api_ops(limit: int = 40):
                 continue
             if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
                                    "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
-                                   "SYNC", "BUY_BLOCK", "VENTA_PROPIA",
+                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA",
                                    "VENTA_EXTERNA", "VENTA_FAIL",
                                    "PIRAMIDE", "PIRAMIDE_FAIL"):
                 out.append(d)
@@ -2823,7 +2823,7 @@ def _auto_trader():
                     continue
                 caida = drawdown_actual()
                 if caida is not None and caida >= MAX_DRAWDOWN:
-                    log("AUTO", "-", f"parado: caída {caida*100:.0f}% ≥ {MAX_DRAWDOWN*100:.0f}%")
+                    log("SISTEMA", "-", f"PARADO: caída {caida*100:.0f}% ≥ {MAX_DRAWDOWN*100:.0f}%")
                     ST.risk.halted = True
                     time.sleep(600)
                     continue
@@ -2917,7 +2917,7 @@ def _auto_trader():
             time.sleep(AUTO_CADA)
 
     threading.Thread(target=bucle, daemon=True).start()
-    log("AUTO", "-", f"trading autónomo ACTIVO · ciclo {AUTO_CADA}s · corte -50%")
+    log("SISTEMA", "-", f"motor arrancado · ronda {AUTO_CADA:.0f}s · corte -{MAX_DRAWDOWN*100:.0f}%")
 
 
 @app.on_event("startup")
