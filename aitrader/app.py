@@ -84,6 +84,20 @@ CFG = {
     # 选择质量：共识 = 聪明钱(smart_degen) + 知名KOL(renowned) 计数之和
     "min_smart_money_confluence": 1,
     "min_llm_conviction": 0.6,
+
+    # ── REGLAS DE BOTS RENTABLES (01/09) ────────────────────────────────
+    # Diagnóstico del propio sistema: 3 de 3 perdedoras murieron en <15 min
+    # tras entrar en pumps de +100% a +300% en 5 min. "Eras la salida de
+    # otro": la esperanza matemática de comprar en la vela 3+ de un pump es
+    # negativa. Se compra la aceleración temprana, no la extensión.
+    "max_chg_5m_entrada": 0.50,     # >+50% en 5m = pump ya consumido
+    # ☠️ NO ES compras/ventas. Medido sobre 100 tokens reales de GMGN:
+    # mediana 0.53, percentil 95 = 0.72, MÁXIMO 0.92 — nunca pasa de 1.
+    # El consejo genérico ("ratio >2:1") venía de otra métrica; aplicarlo
+    # aquí rechazaba 81 de 100 y dejaba CERO candidatas. Calibrado al
+    # percentil 75 real, que es "presión compradora por encima de la media".
+    "min_buy_ratio_entrada": 0.58,
+
     # dev 评估维度：初排后只对前 dev_pool_n 个幸存者额外查 dev 历史（token info 的 dev 对象），
     # 结果按地址缓存 dev_info_ttl_s 秒（dev 历史变化慢，跨轮复用、不每轮重拉，省 cli 配额）。
     # ☠️ ESTE ES EL MULTIPLICADOR REAL DEL CONSUMO: 24 devs × 3 llamadas cada
@@ -932,6 +946,14 @@ def hard_gates(f: TokenFeatures, chain: str = "sol"):
         return False, f"REJECT 避雷：税过高 买{f.buy_tax:.0%}/卖{f.sell_tax:.0%}", 1
     if f.rug_ratio > CFG["max_rug_ratio"]:
         return False, f"REJECT 避雷：rug 比例 {f.rug_ratio:.0%} > {CFG['max_rug_ratio']:.0%}", 1
+    # ☠️ TECHO DE MOMENTUM: llegar tarde a un pump es la causa medida de
+    # las 3 perdedoras del 01/09 (-23%, -23%, -36%, todas en <8 min).
+    if f.chg_5m > CFG["max_chg_5m_entrada"]:
+        return False, (f"REJECT tarde: ya subió {f.chg_5m*100:+.0f}% en 5m "
+                       f"(techo {CFG['max_chg_5m_entrada']*100:.0f}%)"), 1
+    if f.buy_ratio < CFG["min_buy_ratio_entrada"]:
+        return False, (f"REJECT sin presión: ratio {f.buy_ratio:.1f} < "
+                       f"{CFG['min_buy_ratio_entrada']} (distribución)"), 1
     if f.bundler > CFG["max_bundler_ratio"]:
         return False, f"REJECT 避雷：bundler {f.bundler:.0%} > {CFG['max_bundler_ratio']:.0%}", 1
     if f.dev_hold > CFG["max_dev_holding_pct"]:
@@ -1927,12 +1949,15 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
             # GMGN: se ejecutan aunque el Mac esté apagado o la IP baneada.
             salidas = json.dumps([
                 {"order_type": "profit_stop", "side": "sell",
-                 "price_scale": "120", "sell_ratio": "40"},
+                 # +30% vende la MITAD: recuperas casi el principal y el
+                 # resto corre gratis. Esperar el 10x en cada trade es lo
+                 # que convierte ganadores en las pérdidas de hoy.
+                 "price_scale": "30", "sell_ratio": "50"},
                 {"order_type": "profit_stop_trace", "side": "sell",
-                 "price_scale": "150", "sell_ratio": "100",
+                 "price_scale": "80", "sell_ratio": "100",
                  "drawdown_rate": "30"},
                 {"order_type": "loss_stop", "side": "sell",
-                 "price_scale": "40", "sell_ratio": "100"},
+                 "price_scale": "25", "sell_ratio": "100"},
             ])
             order = g.swap(from_wallet=wallet, input_token=native_token(chain),
                            output_token=address, amount=amount, slippage=10,
@@ -2638,14 +2663,17 @@ def vender_si_toca(chain: str) -> bool:
             _guardar_picos()
 
         motivo = None
-        if pico > 0.15 and (pico - pnl) > 0.25:
+        if pico > 0.15 and (pico - pnl) > 0.15:
             motivo = (f"trailing propio: tocó {pico*100:+.0f}% y ha devuelto "
                       f"{(pico-pnl)*100:.0f} puntos")
-        elif pnl < -0.30:
+        elif pnl < -0.20:
             # ☠️ -35 dejaba solo 5 puntos hasta el -40 de GMGN: entre revisión
             # y revisión el precio se los salta. A -30 hay 10 puntos de
             # margen para que el stop LOCAL actúe antes que el remoto.
-            motivo = f"stop: {pnl*100:+.0f}% (corte en -30%)"
+            # -12% recomendado es inviable con la volatilidad de estos
+            # tokens (te saca de ganadoras por ruido normal); -20% es el
+            # punto donde el stop contiene sin ahogar.
+            motivo = f"stop: {pnl*100:+.0f}% (corte en -20%)"
         else:
             comprada = pos.get("ts") or pos.get("t") or 0
             try:
@@ -2910,12 +2938,15 @@ def factor_aprendido(chain: str) -> float:
       · Si Kelly sale negativo (el sistema pierde en esa cadena) -> 8%:
         apostar menos donde se pierde es la mitad de "aprender el tamaño".
     """
-    base = 0.20
+    # 1-2% (lo estándar) es inviable con $367: las comisiones se comerían
+    # el 7-11% de cada operación (medido). 10% deja el coste en ~3,8% y
+    # permite 10 posiciones antes de agotar el saldo.
+    base = 0.10
     try:
         datos = json.loads(SIZING_FILE.read_text())
         v = datos.get(chain)
         if v and isinstance(v.get("fraccion"), (int, float)):
-            return max(0.08, min(0.30, float(v["fraccion"])))
+            return max(0.05, min(0.20, float(v["fraccion"])))
     except Exception:
         pass
     return base
@@ -2956,7 +2987,7 @@ def recalcular_sizing() -> dict:
         # 20% base, o sea "aprender" empeoraba el tamaño de un sistema
         # ganador. Con kelly/2 sube al 22% cuando gana y baja al suelo
         # cuando pierde, que es lo que Javi pidió.
-        fraccion = max(0.08, min(0.30, kelly / 2))
+        fraccion = max(0.05, min(0.20, kelly / 2))
         out[ch] = {"fraccion": round(fraccion, 4), "winrate": W,
                    "R": round(R, 2), "kelly": round(kelly, 3),
                    "ops": n, "calculado": time.strftime("%Y-%m-%d %H:%M")}
@@ -3011,10 +3042,10 @@ def tamano_auto(chain: str) -> float:
     # posiciones tan pequeñas que las comisiones (~3%/ciclo) se lo coman.
     if chain == "sol":
         disponible = saldo - 0.02      # colchón fees/rent en SOL
-        tope_chain = max(tope, round(saldo * factor_aprendido(chain), 5))
+        tope_chain = round(saldo * factor_aprendido(chain), 5)
     else:
         disponible = saldo - 0.002
-        tope_chain = max(0.008, round(saldo * factor_aprendido(chain), 5))
+        tope_chain = round(saldo * factor_aprendido(chain), 5)
     if disponible < tope_chain * 0.5:
         return 0.0                     # ni media posición: no operar
     return round(min(tope_chain, disponible), 5)
