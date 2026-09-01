@@ -1941,9 +1941,21 @@ def do_buy(chain: str, address: str, size_sol: float) -> dict:
                  top10=sec.get("top10", 0.0))
     symbol = sanitize(info.get("symbol", ""))
     try:
-        entry_price = g.token_price(address)         # 建仓价（逃生监控算涨跌基准）
+        entry_price = float(g.token_price(address) or 0)
     except Exception:
         entry_price = 0.0
+    if not entry_price:
+        # sin precio de entrada no hay stop posible: agotar las fuentes
+        entry_price = float(_precio_dexscreener(address) or 0)
+    if not entry_price:
+        try:
+            entry_price = float(g.token_price(address) or 0)
+        except Exception:
+            entry_price = 0.0
+    if not entry_price:
+        log("SIN_PRECIO_ENTRADA", symbol,
+            "compra ABORTADA: sin precio no hay stop-loss posible")
+        raise HTTPException(503, "sin precio de entrada: no se compra a ciegas")
 
     # LIVE 且未锁：真实买入（input=本链原生币，output=目标币，amount=最小单位）。
     if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
@@ -2732,9 +2744,11 @@ def vender_si_toca(chain: str) -> bool:
     return False
 
 
-PIRAMIDE_MIN = 0.25      # +25%: la subida confirma el pronostico -> se añade
-PIRAMIDE_MAX = 0.80      # por encima de +80% ya es tarde: seria comprar el pico
-_PIRAMIDADAS: set = set()
+PIRAMIDE_MIN = 0.25      # +25%: la subida confirma el pronóstico -> se añade
+PIRAMIDE_MAX = 3.00      # hasta +300%: mientras siga subiendo, se sigue
+PIRAMIDE_PASOS = 3       # ampliaciones máximas por token
+PIRAMIDE_SALTO = 0.40    # cada ampliación exige +40 puntos sobre la anterior
+_PIRAMIDADAS: dict = {}  # address -> (veces, último pnl al que se amplió)
 
 
 def piramidar_si_confirma(chain: str) -> bool:
@@ -2753,7 +2767,10 @@ def piramidar_si_confirma(chain: str) -> bool:
         if pos.get("chain", "sol") != chain:
             continue
         addr = pos.get("address") or ""
-        if not addr or addr in _PIRAMIDADAS:
+        if not addr:
+            continue
+        veces, ultimo = _PIRAMIDADAS.get(addr, (0, 0.0))
+        if veces >= PIRAMIDE_PASOS:
             continue
         ep = pos.get("entry_price") or 0
         if not ep:
@@ -2764,6 +2781,10 @@ def piramidar_si_confirma(chain: str) -> bool:
         pnl = cur / ep - 1
         if not (PIRAMIDE_MIN <= pnl <= PIRAMIDE_MAX):
             continue
+        # escalonado: cada nueva ampliación exige otros +40 puntos, para no
+        # meter tres veces seguidas en el mismo nivel de precio
+        if veces and pnl < ultimo + PIRAMIDE_SALTO:
+            continue
         cuanto = tamano_auto(chain)
         if cuanto <= 0:
             continue
@@ -2773,9 +2794,10 @@ def piramidar_si_confirma(chain: str) -> bool:
             continue
         try:
             res = do_buy(chain, addr, cuanto)
-            _PIRAMIDADAS.add(addr)
+            _PIRAMIDADAS[addr] = (veces + 1, pnl)
             log("PIRAMIDE", pos.get("symbol"),
-                f"AMPLIADA {cuanto} — iba {pnl*100:+.0f}% y confirma el pronóstico",
+                f"AMPLIADA {cuanto} ({veces+1}/{PIRAMIDE_PASOS}) — "
+                f"iba {pnl*100:+.0f}% y sigue subiendo",
                 {"tx": str(res.get("tx") or "")[:80]})
             return True
         except Exception as e:
@@ -3190,7 +3212,11 @@ def factor_aprendido(chain: str) -> float:
     # 1-2% (lo estándar) es inviable con $367: las comisiones se comerían
     # el 7-11% de cada operación (medido). 10% deja el coste en ~3,8% y
     # permite 10 posiciones antes de agotar el saldo.
-    base = 0.10
+    # Javi (01/09) tras BOMBA (+81% con solo $14 dentro): "haz que opere
+    # con 24". Se sube a 20% del saldo con SUELO de $24 equivalente, para
+    # que un saldo bajo no deje la posición en calderilla: con comisiones
+    # de ~3% por ciclo, por debajo de $20 el peaje se come la ganancia.
+    base = 0.20
     try:
         datos = json.loads(SIZING_FILE.read_text())
         v = datos.get(chain)
@@ -3291,10 +3317,10 @@ def tamano_auto(chain: str) -> float:
     # posiciones tan pequeñas que las comisiones (~3%/ciclo) se lo coman.
     if chain == "sol":
         disponible = saldo - 0.02      # colchón fees/rent en SOL
-        tope_chain = round(saldo * factor_aprendido(chain), 5)
+        tope_chain = max(0.24, round(saldo * factor_aprendido(chain), 5))
     else:
         disponible = saldo - 0.002
-        tope_chain = round(saldo * factor_aprendido(chain), 5)
+        tope_chain = max(0.0097, round(saldo * factor_aprendido(chain), 5))
     if disponible < tope_chain * 0.5:
         return 0.0                     # ni media posición: no operar
     return round(min(tope_chain, disponible), 5)
