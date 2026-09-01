@@ -1467,6 +1467,8 @@ class RiskManager:
         # `max_concurrent_positions=4` no se alcanzaba NUNCA. El tope de
         # exposición tiene que escalar con el tamaño de posición, no ser
         # un número suelto — mínimo 3 posiciones simultáneas.
+        if size_sol <= 0:
+            return False, "tamaño inválido (<=0)"
         tope_expo = max(CFG["max_total_exposure_sol"],
                         CFG["max_per_trade_sol"] * 3)
         if exposure + size_sol > tope_expo:
@@ -2493,6 +2495,9 @@ def _precalentar_cache():
     return
 
 
+_SYNC_LOCK = threading.Lock()
+
+
 def sincronizar_posiciones() -> int:
     """Borra las posiciones que ya NO están en la wallet.
 
@@ -2510,6 +2515,15 @@ def sincronizar_posiciones() -> int:
     """
     if not ST.positions:
         return 0
+    if not _SYNC_LOCK.acquire(blocking=False):
+        return 0            # otro hilo ya está sincronizando: no duplicar
+    try:
+        return _sincronizar_interno()
+    finally:
+        _SYNC_LOCK.release()
+
+
+def _sincronizar_interno() -> int:
     vivos = set()
     # ☠️ DOS programas de token, no uno. Los tokens nuevos de Pump.fun salen
     # como Token-2022 (`TokenzQdBN...`); mirando solo el clásico, la posición
@@ -2685,6 +2699,11 @@ def vender_si_toca(chain: str) -> bool:
 
         if not motivo:
             continue
+        # La posición pudo cerrarse (TP/SL de GMGN) entre que se leyó la
+        # lista y ahora: re-verificar evita el "502 链上卖出失败" por
+        # intentar vender lo ya vendido.
+        if not any(q.get("address") == addr for q in ST.positions):
+            continue
         try:
             do_sell(addr)
             _PICOS.pop(addr, None)
@@ -2820,7 +2839,20 @@ def señal_smart_money(chain: str) -> dict | None:
         _COPY_VISTOS.add(addr)
         return {"address": addr, "symbol": d.get("symbol") or addr[:6],
                 "veces": s.get("signal_times", 1),
-                "bundle": bundle, "top10": top10}
+                "bundle": bundle, "top10": top10,
+                # mismos campos que el screener: si no, Claude juzga a ciegas
+                "features": {
+                    "age_min": _f(d.get("open_timestamp")) and None,
+                    "mcap": _f(d.get("market_cap")),
+                    "liquidity": _f(d.get("liquidity")),
+                    "bundler": bundle, "top10": top10,
+                    "dev_hold": _f(d.get("dev_team_hold_rate")),
+                    "chg_5m": _f(d.get("price_change_percent5m")),
+                    "chg_1h": _f(d.get("price_change_percent1h")),
+                    "buy_ratio": _f(d.get("buy_ratio")),
+                    "sm_confluence": s.get("signal_times", 1),
+                    "sniper_count": _f(d.get("sniper_count")),
+                    "rug": rug}}
     return None
 
 
@@ -2870,19 +2902,27 @@ def veto_de_claude(dec: dict) -> tuple[bool, str]:
     if not USAR_CLAUDE:
         return True, ""
     f = dec.get("features") or {}
+
+    def _num(v, mult=1):
+        """Los features pueden venir como texto o None desde la API."""
+        try:
+            return round(float(v) * mult)
+        except (TypeError, ValueError):
+            return None
+
     datos = {
         "edad_minutos": f.get("age_min"),
         "market_cap_usd": f.get("mcap"),
         "liquidez_usd": f.get("liquidity"),
-        "bundle_pct": round((f.get("bundler") or 0) * 100),
-        "top10_pct": round((f.get("top10") or 0) * 100),
-        "dev_holding_pct": round((f.get("dev_hold") or 0) * 100),
-        "cambio_5m_pct": round((f.get("chg_5m") or 0) * 100),
-        "cambio_1h_pct": round((f.get("chg_1h") or 0) * 100),
+        "bundle_pct": _num(f.get("bundler"), 100),
+        "top10_pct": _num(f.get("top10"), 100),
+        "dev_holding_pct": _num(f.get("dev_hold"), 100),
+        "cambio_5m_pct": _num(f.get("chg_5m"), 100),
+        "cambio_1h_pct": _num(f.get("chg_1h"), 100),
         "ratio_compra_venta": f.get("buy_ratio"),
         "smart_money_dentro": f.get("sm_confluence"),
         "snipers": f.get("sniper_count"),
-        "rug_ratio_pct": round((f.get("rug") or 0) * 100),
+        "rug_ratio_pct": _num(f.get("rug"), 100),
     }
     # ☠️ 25s de techo. Medido: una consulta tardó 64s y ese tiempo bloquea
     # el bucle entero mientras el precio se mueve. Si Claude no contesta a
@@ -3290,6 +3330,14 @@ def _auto_trader():
                             if cuanto > 0 else (False, "sin saldo suficiente"))
                         if permite:
                             try:
+                                ok_c, mot_c = veto_de_claude(
+                                    {"symbol": sm.get("symbol"),
+                                     "features": sm.get("features") or {}})
+                                if not ok_c:
+                                    log("CLAUDE_VETO", sm.get("symbol"),
+                                        f"copy NO COMPRADA — {mot_c}")
+                                    time.sleep(AUTO_CADA)
+                                    continue
                                 res = do_buy(chain, sm["address"], cuanto)
                                 log("COPY", sm["symbol"],
                                     f"COMPRADA {cuanto} — "
