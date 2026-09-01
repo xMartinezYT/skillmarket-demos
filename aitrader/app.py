@@ -1662,7 +1662,11 @@ ST.positions = load_positions()
 
 def log(action: str, symbol: str, reason: str, extra: dict | None = None):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    rec = dict(ts=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    # ☠️ EL LOG ESCRIBÍA EN UTC y Javi lee en Chipre (UTC+3): las 14:32 del
+    # log eran las 17:32 suyas, así que parecía que el bot llevaba 3 HORAS
+    # parado cuando llevaba 6 minutos. Hora local siempre — quien lee el
+    # feed vive en una zona, no en UTC.
+    rec = dict(ts=datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
                action=action, symbol=symbol, reason=reason, mode=ST.mode, **(extra or {}))
     with LOG_PATH.open("a") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -2286,7 +2290,7 @@ def api_ops(limit: int = 40):
                 continue
             if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
                                    "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
-                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA",
+                                   "SYNC", "BUY_BLOCK", "SISTEMA", "VENTA_PROPIA", "VENTA_CIEGA", "GUARDIAN_FAIL",
                                    "VENTA_EXTERNA", "VENTA_FAIL",
                                    "PIRAMIDE", "PIRAMIDE_FAIL"):
                 out.append(d)
@@ -2621,8 +2625,11 @@ def vender_si_toca(chain: str) -> bool:
         if pico > 0.15 and (pico - pnl) > 0.25:
             motivo = (f"trailing propio: tocó {pico*100:+.0f}% y ha devuelto "
                       f"{(pico-pnl)*100:.0f} puntos")
-        elif pnl < -0.35:
-            motivo = f"stop de respaldo: {pnl*100:+.0f}% (la orden GMGN no saltó)"
+        elif pnl < -0.30:
+            # ☠️ -35 dejaba solo 5 puntos hasta el -40 de GMGN: entre revisión
+            # y revisión el precio se los salta. A -30 hay 10 puntos de
+            # margen para que el stop LOCAL actúe antes que el remoto.
+            motivo = f"stop: {pnl*100:+.0f}% (corte en -30%)"
         else:
             comprada = pos.get("ts") or pos.get("t") or 0
             try:
@@ -2943,6 +2950,29 @@ def tamano_auto(chain: str) -> float:
     return round(min(tope_chain, disponible), 5)
 
 
+def _guardian_posiciones():
+    """Vigila lo ABIERTO cada 45s, en su propio hilo.
+
+    ☠️ POR QUÉ UN HILO APARTE. Las ventas vivían dentro del bucle de
+    compra, que hace `screen_once` (105s en robinhood) + `sleep(300)` entre
+    rondas y un `continue` tras cada operación. Resultado medido el 01/09:
+    una posición comprada a las 17:47 no se evaluó NI UNA VEZ en 10 min y
+    Javi tuvo que cerrarla a mano a -40% con el stop puesto en -35%.
+    Proteger capital no puede competir por tiempo con buscar oportunidades:
+    el guardián solo mira precios (GMGN/DexScreener, sin escaneo) y actúa.
+    """
+    time.sleep(20)
+    while True:
+        try:
+            if ST.mode == "LIVE" and not LIVE_TRADING_DISABLED:
+                sincronizar_posiciones()
+                for ch in ("sol", "robinhood"):
+                    vender_si_toca(ch)
+        except Exception as e:
+            log("GUARDIAN_FAIL", "-", str(e)[:140])
+        time.sleep(45)
+
+
 @app.on_event("startup")
 def _auto_trader():
     """El AI Trader opera SOLO, sin que Javi pulse nada.
@@ -3001,16 +3031,7 @@ def _auto_trader():
                     except Exception:
                         pass
 
-                # Las DOS cadenas, no solo la del turno: con turnos alternos,
-                # una posición sangrando en robinhood esperaba 2 rondas (10
-                # min) a que le tocara su cadena. Vender no gasta cuota GMGN.
-                vendida = False
-                for ch_v in ("sol", "robinhood"):
-                    if vender_si_toca(ch_v):
-                        vendida = True
-                if vendida:
-                    time.sleep(AUTO_CADA)
-                    continue         # una operación por ronda
+                # (las ventas las lleva `_guardian_posiciones`, en su hilo)
 
                 r = screen_once(chain) or {}
 
@@ -3083,6 +3104,7 @@ def _auto_trader():
             time.sleep(AUTO_CADA)
 
     threading.Thread(target=bucle, daemon=True).start()
+    threading.Thread(target=_guardian_posiciones, daemon=True).start()
     log("SISTEMA", "-", f"motor arrancado · ronda {AUTO_CADA:.0f}s · corte -{MAX_DRAWDOWN*100:.0f}%")
 
 
