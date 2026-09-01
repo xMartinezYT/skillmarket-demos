@@ -170,7 +170,10 @@ function pintaPosiciones(pos) {
     pos.map(p => {
       const pnl = (p.pnl ?? 0) * 100;
       return `<tr>
-        <td><b>${p.symbol || "?"}</b></td>
+        <td><a href="https://gmgn.ai/${p.chain || "sol"}/token/${p.address}?ref=P5ulV5oU"
+               target="_blank" rel="noopener"
+               style="color:var(--am);text-decoration:none;border-bottom:1px dotted var(--am2)">
+               <b>${p.symbol || "?"}</b> ↗</a></td>
         <td class="gris">${p.chain || "sol"}</td>
         <td>${p.size_sol}</td>
         <td class="${pnl >= 0 ? "verde" : "rojo"}">${pnl >= 0 ? "+" : ""}${pnl.toFixed(1)}%</td>
@@ -230,7 +233,10 @@ async function pintaScanner() {
         const c = d.decision;
         return `<tr>
           <td class="ambar">${c.priority ?? ""}</td>
-          <td><b>${c.symbol || c.address.slice(0, 8)}</b></td>
+          <td><a href="https://gmgn.ai/${chain}/token/${c.address}?ref=P5ulV5oU"
+                 target="_blank" rel="noopener"
+                 style="color:var(--ink);text-decoration:none;border-bottom:1px dotted var(--line2)">
+                 <b>${c.symbol || c.address.slice(0, 8)}</b> ↗</a></td>
           <td class="gris" style="max-width:430px">${(c.reason || "").slice(0, 90)}</td>
           <td><button class="accion" onclick="comprar('${c.address}',${c.size_sol})">COMPRAR ${c.size_sol}</button></td>
         </tr>`;
