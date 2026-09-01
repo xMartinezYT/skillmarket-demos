@@ -219,10 +219,17 @@ def analizar(cerradas: list[dict]) -> dict:
         if not ops:
             continue
         g = [c for c in ops if c["pnl"] > 0]
+        perd = [c for c in ops if c["pnl"] <= 0]
+        # Ganancia y pérdida MEDIAS: son lo que necesita Kelly para calcular
+        # el tamaño óptimo por trade (R = ganancia_media / pérdida_media).
+        gm = (sum(c["pnl"] for c in g) / len(g) * 100) if g else 0.0
+        pm = (sum(c["pnl"] for c in perd) / len(perd) * 100) if perd else 0.0
         por_cadena[ch] = {
             "cerradas": len(ops),
             "ganadoras": len(g),
             "winrate": round(len(g) / len(ops) * 100, 1),
+            "ganancia_media_pct": round(gm, 1),
+            "perdida_media_pct": round(pm, 1),
             "pnl_medio_pct": round(sum(c["pnl"] for c in ops) / len(ops) * 100, 1),
             "aproximado": any(c.get("aproximado") for c in ops),
             "fiable": len(ops) >= 5,       # con <5 no se concluye nada

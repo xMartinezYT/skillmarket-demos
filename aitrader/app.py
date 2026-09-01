@@ -2810,6 +2810,90 @@ def porque_compra(dec: dict) -> str:
     return " · ".join(partes[:4])
 
 
+SIZING_FILE = OUT_DIR / "sizing_aprendido.json"
+
+
+def factor_aprendido(chain: str) -> float:
+    """Cuánto arriesgar por trade SEGÚN LO QUE HA PASADO, no según una
+    constante que escribí yo.
+
+    Javi (01/09): *"que aprenda cuánta cantidad es más óptima meter por
+    trade basándose en el balance actual"*.
+
+    Base: fracción de Kelly. Kelly dice qué fracción del capital maximiza
+    el crecimiento dado un winrate y una relación ganancia/pérdida:
+        f = W - (1-W)/R
+    Se usa **un cuarto de Kelly** porque Kelly pleno es brutalmente
+    volátil (drawdowns del 50% son normales) y aquí hay un corte al -50%
+    que pararía el sistema entero antes de que Kelly se recupere.
+
+    Guardarraíles:
+      · Sin 8 operaciones cerradas de esa cadena -> se queda en el 20% base.
+      · El resultado se acota entre 8% y 30% del saldo.
+      · Si Kelly sale negativo (el sistema pierde en esa cadena) -> 8%:
+        apostar menos donde se pierde es la mitad de "aprender el tamaño".
+    """
+    base = 0.20
+    try:
+        datos = json.loads(SIZING_FILE.read_text())
+        v = datos.get(chain)
+        if v and isinstance(v.get("fraccion"), (int, float)):
+            return max(0.08, min(0.30, float(v["fraccion"])))
+    except Exception:
+        pass
+    return base
+
+
+def recalcular_sizing() -> dict:
+    """Recalcula la fracción óptima por cadena con los cierres reales.
+
+    Lo llama el bucle del auto-trader cada hora; el cálculo vive en
+    `aprender.py`, que es quien sabe leer los ciclos cerrados de la cadena.
+    """
+    try:
+        import subprocess
+        r = subprocess.run(
+            [str(HERE / "venv" / "bin" / "python3"), str(HERE / "aprender.py"),
+             "--json"],
+            capture_output=True, text=True, timeout=180,
+            cwd=str(HERE), env={**os.environ, "PYTHONPATH": ""})
+        res = json.loads(r.stdout)
+    except Exception as e:
+        log("SIZING", "-", f"no se pudo recalcular: {str(e)[:80]}")
+        return {}
+
+    out = {}
+    for ch, v in (res.get("por_cadena") or {}).items():
+        n = v.get("cerradas", 0)
+        if n < 8:                       # muestra insuficiente: no tocar
+            continue
+        W = v.get("winrate", 0) / 100
+        gan = v.get("ganancia_media_pct")
+        per = v.get("perdida_media_pct")
+        if not gan or not per:
+            continue
+        R = abs(gan / per) if per else 1.0
+        kelly = W - (1 - W) / R if R else -1
+        # ☠️ MEDIO Kelly, no un cuarto. Medido el 01/09: con kelly/4 un
+        # sistema BUENO (wr 60%, R 2.7) arriesgaba el 11% — MENOS que el
+        # 20% base, o sea "aprender" empeoraba el tamaño de un sistema
+        # ganador. Con kelly/2 sube al 22% cuando gana y baja al suelo
+        # cuando pierde, que es lo que Javi pidió.
+        fraccion = max(0.08, min(0.30, kelly / 2))
+        out[ch] = {"fraccion": round(fraccion, 4), "winrate": W,
+                   "R": round(R, 2), "kelly": round(kelly, 3),
+                   "ops": n, "calculado": time.strftime("%Y-%m-%d %H:%M")}
+        log("SIZING", ch,
+            f"tamaño aprendido {fraccion*100:.0f}% del saldo "
+            f"(winrate {W*100:.0f}%, R {R:.1f}, {n} ops)")
+    if out:
+        try:
+            SIZING_FILE.write_text(json.dumps(out, indent=1))
+        except Exception:
+            pass
+    return out
+
+
 def tamano_auto(chain: str) -> float:
     """Importe adaptado al saldo REAL de la cadena QUE SE VA A OPERAR.
 
@@ -2850,10 +2934,10 @@ def tamano_auto(chain: str) -> float:
     # posiciones tan pequeñas que las comisiones (~3%/ciclo) se lo coman.
     if chain == "sol":
         disponible = saldo - 0.02      # colchón fees/rent en SOL
-        tope_chain = max(tope, round(saldo * 0.20, 5))
+        tope_chain = max(tope, round(saldo * factor_aprendido(chain), 5))
     else:
         disponible = saldo - 0.002
-        tope_chain = max(0.008, round(saldo * 0.20, 5))
+        tope_chain = max(0.008, round(saldo * factor_aprendido(chain), 5))
     if disponible < tope_chain * 0.5:
         return 0.0                     # ni media posición: no operar
     return round(min(tope_chain, disponible), 5)
@@ -2880,6 +2964,7 @@ def _auto_trader():
     def bucle():
         time.sleep(45)                     # deja arrancar y que el ban expire
         turno = 0
+        ultimo_sizing = 0.0
         while True:
             try:
                 # Robinhood PRIMERO: con sol delante, la ronda de sol gastaba
@@ -2906,6 +2991,16 @@ def _auto_trader():
                 # buscar lo siguiente — vender es barato (DexScreener + 1
                 # swap), mirar es caro.
                 sincronizar_posiciones()
+
+                # Reaprender el tamaño óptimo cada hora (barato: lee la
+                # cadena, no la API de GMGN).
+                if time.time() - ultimo_sizing > 3600:
+                    ultimo_sizing = time.time()
+                    try:
+                        recalcular_sizing()
+                    except Exception:
+                        pass
+
                 # Las DOS cadenas, no solo la del turno: con turnos alternos,
                 # una posición sangrando en robinhood esperaba 2 rondas (10
                 # min) a que le tocara su cadena. Vender no gasta cuota GMGN.
