@@ -2237,6 +2237,54 @@ def api_unmonitor(s: SellIn):
     with ST.lock:
         return do_unmonitor(s.address)
 
+
+@app.get("/api/ops")
+def api_ops(limit: int = 40):
+    """Operaciones y eventos del auto-trader para la UI nueva.
+
+    Lee `trade_decisions.jsonl` filtrando solo lo accionable (compras,
+    ventas, copys, skips y fallos) — el ruido de SCREEN/FILTER se queda
+    fuera, que para eso está el fichero completo en disco.
+    """
+    out = []
+    try:
+        with LOG_PATH.open() as fh:
+            lineas = fh.readlines()[-3000:]
+        for l in reversed(lineas):
+            try:
+                d = json.loads(l)
+            except Exception:
+                continue
+            if d.get("action") in ("BUY", "SELL", "AUTO", "COPY", "AUTO_FAIL",
+                                   "COPY_FAIL", "AUTO_SKIP", "COPY_SKIP",
+                                   "SYNC", "BUY_BLOCK"):
+                out.append(d)
+                if len(out) >= limit:
+                    break
+    except Exception:
+        pass
+    return {"ops": out}
+
+
+@app.get("/api/resumen")
+def api_resumen():
+    """Números de cabecera: saldos reales, drawdown y el corte."""
+    saldo = _saldo_cadena_usd()
+    dd = drawdown_actual()
+    try:
+        ref = json.loads(EQUITY_FILE.read_text())
+    except Exception:
+        ref = {}
+    return {
+        "saldo_usd": saldo,
+        "drawdown": dd,
+        "pico_usd": ref.get("pico"),
+        "corte_usd": (ref.get("pico") or 0) * (1 - MAX_DRAWDOWN),
+        "max_drawdown": MAX_DRAWDOWN,
+        "copytrade": COPYTRADE,
+        "auto_cada": AUTO_CADA,
+    }
+
 @app.get("/api/positions")
 def api_positions(chain: str = "sol"):
     if PUBLIC_DEMO:                       # 公开页不广播本机持仓
