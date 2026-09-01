@@ -195,7 +195,11 @@ AUTO_CADA = 300.0        # una ronda cada 3 min, alternando sol/robinhood
 # aprenda". El -50% paró el sistema a las 21:39 con 51% de caída. Se sube
 # a 80% para que siga generando muestra; sigue siendo un tope real para
 # que nunca llegue a cero y quede algo con lo que operar.
-MAX_DRAWDOWN = 0.80
+# Javi (02/09): "quita el cap que tiene y que se siga entrenando".
+# Sin corte por drawdown: el único límite real pasa a ser que se acabe el
+# saldo. El gate sigue exigiendo LECTURA de saldo (si el RPC falla no se
+# opera a ciegas), pero ya no para por cuánto se haya perdido.
+MAX_DRAWDOWN = 9.99
 
 # 公开演示（只读广播）：设环境变量 PUBLIC_DEMO=1 开启。用于把看板挂公网给不特定访客看
 # 真实筛选数据，同时把后端收敛成纯只读：
@@ -3370,10 +3374,10 @@ def tamano_auto(chain: str) -> float:
     # posiciones tan pequeñas que las comisiones (~3%/ciclo) se lo coman.
     if chain == "sol":
         disponible = saldo - 0.02      # colchón fees/rent en SOL
-        tope_chain = max(0.24, round(saldo * factor_aprendido(chain), 5))
+        tope_chain = round(saldo * factor_aprendido(chain), 5)
     else:
         disponible = saldo - 0.002
-        tope_chain = max(0.0097, round(saldo * factor_aprendido(chain), 5))
+        tope_chain = round(saldo * factor_aprendido(chain), 5)
     if disponible < tope_chain * 0.5:
         return 0.0                     # ni media posición: no operar
     return round(min(tope_chain, disponible), 5)
